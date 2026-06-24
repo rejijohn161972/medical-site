@@ -76,7 +76,8 @@ def run(limit: int | None = None, discovery_only: bool = False, headed: bool | N
             raise RuntimeError("OpenAI API key is missing. Run 1_FIRST_TIME_SETUP.bat and enter it.")
 
         # Always capture a discovery snapshot so a 0-result run is diagnosable.
-        session.discovery_dump()
+        # Don't open a document here; that happens during normal processing.
+        session.discovery_dump(probe_document=False)
 
         print("Reading pending faxes...")
         faxes = session.collect_pending_faxes(limit=limit)
@@ -94,29 +95,29 @@ def run(limit: int | None = None, discovery_only: bool = False, headed: bool | N
         for idx, fax in enumerate(faxes, start=1):
             print(f"Processing fax {idx} of {len(faxes)}...")
             try:
-                text, final_url, detail_html = session.open_fax_text(fax)
+                doc = session.fetch_document(fax)
                 info = extract_patient_info(
-                    text, cfg["openai_api_key"], model=cfg.get("openai_model", DEFAULT_OPENAI_MODEL)
+                    doc.text, cfg["openai_api_key"], model=cfg.get("openai_model", DEFAULT_OPENAI_MODEL)
                 )
                 patient = info.get("patient_name") or "UNKNOWN"
                 doc_type = info.get("document_type") or "miscellaneous"
                 source = "fallback" if info.get("ai_error") else "ai"
 
-                pdf = session.try_download_pdf(fax, detail_html)
-                folder, saved = save_fax(output_dir, patient, doc_type, fax.fax_id, pdf, text)
+                folder, saved = save_fax(output_dir, patient, doc_type, fax.fax_id,
+                                         doc.pdf_bytes, doc.text, file_ext=doc.file_ext)
 
                 line = f"{display_name(patient)} — {doc_type}"
                 if line not in short_lines:
                     short_lines.append(line)
-                print("  " + line + ("  [pdf]" if pdf else "  [text only]"))
+                print("  " + line + (f"  [{doc.file_ext}]" if doc.pdf_bytes else "  [text only]"))
 
                 summary.add(
                     fax_id=fax.fax_id, patient_name=patient, date_of_birth=info.get("date_of_birth"),
                     document_type=doc_type, confidence=info.get("confidence"), source=source,
-                    pdf_downloaded="yes" if pdf else "no", folder=str(folder), status="ok",
-                    detail=info.get("ai_error", ""),
+                    pdf_downloaded="yes" if doc.pdf_bytes else "no", folder=str(folder), status="ok",
+                    detail=info.get("ai_error") or doc.note,
                 )
-                log_line(f"OK fax_id={fax.fax_id} patient={patient} type={doc_type} pdf={bool(pdf)} saved={saved}")
+                log_line(f"OK fax_id={fax.fax_id} patient={patient} type={doc_type} file={bool(doc.pdf_bytes)} saved={saved}")
             except Exception as e:  # noqa: BLE001 — one bad fax must not stop the run
                 summary.add(fax_id=getattr(fax, "fax_id", "?"), patient_name="UNKNOWN",
                             document_type="miscellaneous", status="error", detail=str(e)[:300])

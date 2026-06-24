@@ -1,13 +1,23 @@
 """Real-browser ProviderFlow automation (Playwright / Chromium).
 
 WHY A REAL BROWSER:
-ProviderFlow is an old PHP portal that renders its pending-fax list with
-client-side JavaScript/AJAX (e.g. batchtable.php). A plain HTTP client
-(requests/urllib) downloads the page *shell* before that JS runs, so it sees
-zero rows -> "Found 0 pending faxes", even though Chrome clearly shows many.
-Driving a real Chromium browser lets the JS run and the rows appear, exactly
-as a human sees them. We then read the *rendered* DOM, across all frames
-(old PHP loves framesets), which is the robust fix.
+ProviderFlow renders its "Pending Documents" table with client-side
+JavaScript/AJAX (DataTables-style: column filters + a live count badge). A
+plain HTTP client (requests/urllib) downloads the page *shell* before that JS
+runs, so it sees zero rows -> "Found 0 pending faxes", even though Chrome
+clearly shows them. Driving a real Chromium browser lets the JS run and the
+rows appear, exactly as a human sees them. We read the *rendered* table rows,
+across all frames, which is the robust fix.
+
+REAL DOM (confirmed from the live portal, logged in as the clinic user):
+  - Login: /login.php with text fields `username` / `password` and a Submit
+    button (also reachable from /index.php).
+  - Pending list on /index.php, tab "Pending Documents", columns:
+      Site | Source | Status | Created By | Assigned To | Created Date |
+      Description / Fulltext | Pages
+  - The patient name is in the Description column as "LASTNAME, FIRSTNAME - ..."
+    so most folders can be named directly from the row text.
+  - Each row has a Pages icon / actions that open the document viewer.
 
 PHI note: this logs into a live medical portal. Run it on the trusted clinic
 machine only. Nothing here transmits PHI anywhere except (separately) the
@@ -28,32 +38,42 @@ except ImportError:  # pragma: no cover - resolved at first real run / setup
     sync_playwright = None
 
 
-# Patterns that identify a "real" fax row and its session key.
+# Patient name in the Description column, e.g. "WILSON, NANCY - Referral".
 NAME_RE = re.compile(r"\b([A-Z][A-Za-z'.\-]+\s*,\s*[A-Z][A-Za-z'.\-]+)")
-SESSION_PATTERNS = [
-    r"loadbatch\(['\"]([A-Fa-f0-9]{12,})['\"]",
-    r"displaysession=([A-Fa-f0-9]{12,})",
-    r"batchselector_([A-Fa-f0-9]{12,})",
-    r"comments_([A-Fa-f0-9]{12,})",
-    r"sessionkey=([A-Za-z0-9]{12,})",
+# Session / document identifiers seen in links and onclick handlers.
+ID_PATTERNS = [
+    r"loadbatch\(['\"]([A-Za-z0-9]{8,})['\"]",
+    r"displaysession\(['\"]?([A-Za-z0-9]{8,})",
+    r"displaysession=([A-Za-z0-9]{8,})",
+    r"sessionkey=([A-Za-z0-9]{8,})",
+    r"(?:docid|documentid|docguid|fileid)=([A-Za-z0-9]{6,})",
+    r"opendoc\(['\"]([A-Za-z0-9]{6,})['\"]",
 ]
-DETAIL_LINK_HINTS = ("quickflow", "sessionkey", "viewfile", "displaysession", "docid", "document")
-PDF_LINK_HINTS = ("pdf", "print", "download", "viewfile", "file=", "getfile")
+# href fragments that look like "open this document".
+OPEN_LINK_HINTS = ("quickflow", "sessionkey", "displaysession", "viewfile",
+                   "viewdoc", "docid", "documentid", "openfile", "getfile",
+                   "showfile", "file=", "fileid", "pdf", "print", "page=")
+# Things that are never the document (avoid clicking these).
+LINK_DENY = ("logout", "log out", "javascript:void", "#", "mailto:", "preferences")
+# Likely file endpoints when fetching the actual document bytes.
+FILE_LINK_HINTS = ("pdf", "viewfile", "getfile", "showfile", "downloadfile",
+                   "download", "file=", "fileid", "print", "page=", "image", "tiff")
 
-# JS that returns lightweight info for every table row in a frame.
-ROW_SCAN_JS = """
+# Returns rich, lightweight info for every table row in a frame.
+ROW_SCAN_JS = r"""
 () => {
   const out = [];
-  for (const r of Array.from(document.querySelectorAll('tr'))) {
-    const text = (r.innerText || '').replace(/\\s+/g, ' ').trim();
-    if (text.length < 3 || text.length > 600) continue;
-    const a = r.querySelector('a[href]');
-    const href = a ? a.getAttribute('href') : '';
-    const clickEl = r.matches('[onclick]') ? r : r.querySelector('[onclick]');
-    const onclick = clickEl ? (clickEl.getAttribute('onclick') || '') : '';
+  for (const r of Array.from(document.querySelectorAll('table tr'))) {
+    const text = (r.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    const tdCount = r.querySelectorAll('td').length;
+    const hasTh = !!r.querySelector('th');
+    const hasFilter = !!r.querySelector('select, input[type=text], input:not([type]), textarea');
+    const anchors = Array.from(r.querySelectorAll('a[href]')).map(a => a.getAttribute('href'));
+    const clicks = Array.from(r.querySelectorAll('[onclick]')).map(e => e.getAttribute('onclick'));
     let html = r.outerHTML || '';
-    if (html.length > 2500) html = html.slice(0, 2500);
-    out.push({ text, href, onclick, html });
+    if (html.length > 4000) html = html.slice(0, 4000);
+    out.push({ text, tdCount, hasTh, hasFilter, anchors, clicks, html });
   }
   return out;
 }
@@ -63,11 +83,23 @@ ROW_SCAN_JS = """
 @dataclass
 class FaxItem:
     fax_id: str
-    label: str               # human-readable row text, e.g. "WILSON, NANCY referral"
-    session_key: str = ""
-    detail_url: str = ""
+    label: str                       # full row text (includes the patient name)
+    doc_id: str = ""                 # session/document id if found
+    open_url: str = ""               # best URL to open the document viewer
+    links: list[str] = field(default_factory=list)   # all resolved row links
+    onclick: str = ""                # combined onclick handlers from the row
     frame_url: str = ""
     raw_html: str = field(default="", repr=False)
+
+
+@dataclass
+class DocResult:
+    text: str
+    url: str
+    html: str = field(default="", repr=False)
+    pdf_bytes: bytes | None = field(default=None, repr=False)
+    file_ext: str = "pdf"
+    note: str = ""
 
 
 class BrowserSession:
@@ -122,16 +154,13 @@ class BrowserSession:
         if not self.username or not self.password:
             raise RuntimeError("ProviderFlow username/password are blank. Run setup again.")
 
-        # GET the portal. ProviderFlow's real login form posts to login.php and
-        # carries hidden fields (viewfile/viewmode/indexone) — a real browser
-        # submits those automatically, so we only fill the visible inputs.
+        # The real login form posts to login.php with visible username/password
+        # plus hidden fields; a real browser submits the hidden fields for us.
         self.page.goto(self.base_url + "/index.php", wait_until="domcontentloaded")
         self._safe_screenshot("01_login_page.png")
 
-        user_box = self._first_locator(["input[name='username']", "input#username",
-                                        "input[type='text']"])
-        pass_box = self._first_locator(["input[name='password']", "input#password",
-                                        "input[type='password']"])
+        user_box = self._first_locator(["input[name='username']", "input#username", "input[type='text']"])
+        pass_box = self._first_locator(["input[name='password']", "input#password", "input[type='password']"])
         if not user_box or not pass_box:
             self._dump_html("01_login_page.html")
             raise RuntimeError("Could not find the ProviderFlow username/password fields on the login page.")
@@ -139,9 +168,9 @@ class BrowserSession:
         user_box.fill(self.username)
         pass_box.fill(self.password)
 
-        # Submit via the obvious button, falling back to Enter in the password box.
         submit = self._first_locator(["input[type='submit']", "button[type='submit']",
-                                      "button:has-text('Log')", "input[value*='Log' i]"])
+                                      "input[value*='Submit' i]", "button:has-text('Submit')",
+                                      "button:has-text('Log')"])
         try:
             if submit:
                 submit.click()
@@ -162,17 +191,18 @@ class BrowserSession:
 
     # -- pending list --------------------------------------------------------
     def collect_pending_faxes(self, limit: int | None = None, max_pages: int = 30) -> list[FaxItem]:
-        """Read every pending fax across all pages from the rendered DOM."""
+        """Read every pending fax across all pages from the rendered table."""
         self._ensure_pending_view()
         self._wait_for_rows()
 
         seen: set[str] = set()
         faxes: list[FaxItem] = []
         for page_no in range(1, max_pages + 1):
+            self._load_all_rows()  # scroll so lazy/long tables render fully
             self._dump_html(f"pending_page_{page_no}.html")
             new_on_page = 0
             for item in self._scan_all_frames():
-                key = item.session_key or _norm(item.label)
+                key = item.doc_id or _norm(item.label)
                 if not key or key in seen:
                     continue
                 seen.add(key)
@@ -203,40 +233,57 @@ class BrowserSession:
 
     def _row_to_fax(self, row: dict, frame_url: str) -> FaxItem | None:
         text = (row.get("text") or "").strip()
-        blob = " ".join([row.get("html", ""), row.get("onclick", ""), row.get("href", "")])
-        session_key = _first_match(SESSION_PATTERNS, blob)
-        name_match = NAME_RE.search(text)
-        href = (row.get("href") or "").strip()
-        detail_link = href if any(h in href.lower() for h in DETAIL_LINK_HINTS) else ""
+        if row.get("hasTh") or row.get("hasFilter"):
+            return None  # header row or the column-filter row
 
-        # A row is a fax only if it names a patient, carries a session key, or
-        # links to a document. This filters out nav/header/layout rows.
-        if not (name_match or session_key or detail_link):
+        anchors = [a for a in (row.get("anchors") or []) if a]
+        clicks = [c for c in (row.get("clicks") or []) if c]
+        blob = " ".join([row.get("html", "")] + clicks + anchors)
+        doc_id = _first_match(ID_PATTERNS, blob)
+        name_match = NAME_RE.search(text)
+        td_count = int(row.get("tdCount") or 0)
+
+        # A pending-document row has the full set of columns (Site..Pages) and is
+        # neither a header nor the filter row. Fall back to name/id for safety.
+        is_data_row = td_count >= 5
+        if not (is_data_row or name_match or doc_id):
             return None
 
-        detail_url = ""
-        if detail_link:
-            detail_url = urljoin(frame_url, html_lib.unescape(detail_link))
-        elif session_key:
-            detail_url = urljoin(self.base_url + "/", f"quickflow/index.php?sessionkey={session_key}")
+        resolved = []
+        for href in anchors:
+            low = (href or "").strip().lower()
+            if not low or any(d in low for d in LINK_DENY):
+                continue
+            resolved.append(urljoin(frame_url, html_lib.unescape(href)))
+
+        open_url = ""
+        for url in resolved:
+            if any(h in url.lower() for h in OPEN_LINK_HINTS):
+                open_url = url
+                break
+        if not open_url and doc_id:
+            open_url = urljoin(self.base_url + "/", f"quickflow/index.php?sessionkey={doc_id}")
+        if not open_url and resolved:
+            open_url = resolved[0]
 
         if name_match:
             fax_id = re.sub(r"[^A-Za-z0-9]+", "_", name_match.group(1)).strip("_")[:60]
+        elif doc_id:
+            fax_id = doc_id
         else:
-            fax_id = session_key or str(abs(hash(text)))[:10]
+            fax_id = "fax_" + str(abs(hash(text)) % 10_000_000)
 
-        return FaxItem(fax_id=fax_id, label=text, session_key=session_key,
-                       detail_url=detail_url, frame_url=frame_url, raw_html=row.get("html", ""))
+        return FaxItem(fax_id=fax_id, label=text, doc_id=doc_id, open_url=open_url,
+                       links=resolved, onclick=" ".join(clicks), frame_url=frame_url,
+                       raw_html=row.get("html", ""))
 
     def _ensure_pending_view(self) -> None:
-        """If no fax rows are visible yet, try clicking a 'Pending' tab/link."""
-        if self._scan_all_frames():
-            return
+        """Make sure the 'Pending Documents' tab is the active view."""
         for frame in self.page.frames:
             try:
-                link = frame.get_by_role("link", name=re.compile(r"pending", re.I)).first
-                if link and link.count() > 0:
-                    link.click()
+                tab = frame.get_by_text(re.compile(r"pending\s+documents", re.I)).first
+                if tab and tab.count() > 0:
+                    tab.click()
                     self._wait_idle()
                     return
             except Exception:
@@ -244,22 +291,39 @@ class BrowserSession:
 
     def _wait_for_rows(self) -> None:
         """Poll for the AJAX-rendered rows to appear."""
-        deadline = self.timeout_ms
-        step = 750
-        waited = 0
-        while waited < deadline:
+        waited, step = 0, 750
+        while waited < self.timeout_ms:
             if self._scan_all_frames():
                 return
             self.page.wait_for_timeout(step)
             waited += step
-        # No rows found within timeout — caller logs "Found 0"; discovery dump
-        # (saved alongside) captures the real DOM so selectors can be confirmed.
+
+    def _load_all_rows(self) -> None:
+        """Scroll to the bottom repeatedly so lazy/long tables render every row."""
+        last = -1
+        for _ in range(20):
+            total = 0
+            for frame in self.page.frames:
+                try:
+                    total += frame.evaluate("() => document.querySelectorAll('table tr').length") or 0
+                except Exception:
+                    pass
+            try:
+                for frame in self.page.frames:
+                    frame.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                pass
+            self.page.wait_for_timeout(400)
+            if total == last:
+                break
+            last = total
 
     def _go_to_next_page(self) -> bool:
         """Best-effort pagination: click a 'Next' control if one exists."""
         before = self._page_signature()
         for frame in self.page.frames:
             for getter in (
+                lambda f: f.locator("a.paginate_button.next:not(.disabled), li.next:not(.disabled) a"),
                 lambda f: f.get_by_role("link", name=re.compile(r"^\s*(next|more|›|»)\s*$", re.I)),
                 lambda f: f.get_by_role("button", name=re.compile(r"^\s*(next|more|›|»)\s*$", re.I)),
                 lambda f: f.locator("a[href*='selectedpage'], a[href*='pagenum'], a[href*='page=']"),
@@ -268,81 +332,148 @@ class BrowserSession:
                     loc = getter(frame).first
                     if loc and loc.count() > 0 and loc.is_enabled():
                         href = (loc.get_attribute("href") or "")
-                        if href.strip().endswith("#"):
-                            continue
+                        if href.strip().endswith("#") and "page" not in href.lower():
+                            pass  # DataTables uses href="#"; still clickable
                         loc.click()
                         self._wait_idle()
+                        self.page.wait_for_timeout(600)
                         if self._page_signature() != before:
                             return True
                 except Exception:
                     continue
         return False
 
-    # -- fax detail + pdf ----------------------------------------------------
-    def open_fax_text(self, fax: FaxItem) -> tuple[str, str, str]:
-        """Open the fax; return (document_text, final_url, detail_html). Best-effort."""
-        url = fax.detail_url
-        if not url:
-            return fax.label, self.page.url, ""
+    # -- document open + copy into folder ------------------------------------
+    def fetch_document(self, fax: FaxItem) -> DocResult:
+        """Open the fax document, capture its text, and download the file bytes.
+
+        Strategy, in order:
+          1. Navigate to the row's open URL (or click the row to trigger a popup).
+          2. From the viewer, find and download the actual file (PDF/image) using
+             the authenticated browser session.
+          3. If no file link is found, fall back to a headless print-to-PDF of the
+             viewer so *something* lands in the patient folder.
+        """
+        viewer, opened_via = self._open_viewer(fax)
+        if viewer is None:
+            return DocResult(text=fax.label, url=fax.open_url or self.page.url,
+                             note="could not open document viewer")
+
         try:
-            detail = self.context.new_page()
-            detail.goto(url, wait_until="domcontentloaded")
-            detail.wait_for_timeout(800)
-            text_parts: list[str] = []
-            html_parts: list[str] = []
-            for frame in detail.frames:
+            viewer.wait_for_timeout(1000)
+            text_parts, html_parts, file_links = [], [], []
+            for frame in viewer.frames:
                 try:
                     for ta in frame.locator("textarea").all():
                         val = (ta.input_value() or "").strip()
                         if len(val) > 20:
                             text_parts.append(val)
                     body = frame.evaluate("() => document.body ? document.body.innerText : ''") or ""
-                    body = re.sub(r"\s+\n", "\n", body).strip()
+                    body = re.sub(r"[ \t]+\n", "\n", body).strip()
                     if len(body) > 40:
                         text_parts.append(body[:8000])
-                    html_parts.append((frame.content() or "")[:20000])
+                    html = frame.content() or ""
+                    html_parts.append(html[:30000])
+                    file_links += self._file_links_in(html, frame.url or viewer.url)
                 except Exception:
                     continue
-            final_url = detail.url
+
+            final_url = viewer.url
+            full_html = "\n".join(html_parts)
+            pdf_bytes, ext = self._download_first_file(file_links)
+
+            if not pdf_bytes and not self.headed:
+                try:
+                    pdf_bytes, ext = viewer.pdf(), "pdf"  # print-to-PDF fallback (headless only)
+                except Exception:
+                    pdf_bytes = None
+
             safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", fax.fax_id)[:60]
-            self._dump_html_for(detail, f"fax_{safe}.html")
-            detail.close()
+            self._dump_html_for(viewer, f"fax_{safe}.html")
+
             text = (fax.label + "\n\n" + "\n\n".join(dict.fromkeys(text_parts))).strip()
-            return text, final_url, "\n".join(html_parts)
+            note = f"opened via {opened_via}; " + ("file downloaded" if pdf_bytes else "no file link found")
+            return DocResult(text=text, url=final_url, html=full_html,
+                             pdf_bytes=pdf_bytes, file_ext=ext, note=note)
+        finally:
+            try:
+                if viewer is not self.page:
+                    viewer.close()
+            except Exception:
+                pass
+
+    def _open_viewer(self, fax: FaxItem):
+        """Return (page, how) for the opened document, or (None, '')."""
+        # 1) Direct navigation to a known open URL.
+        if fax.open_url:
+            try:
+                viewer = self.context.new_page()
+                viewer.goto(fax.open_url, wait_until="domcontentloaded")
+                return viewer, "url"
+            except Exception:
+                pass
+        # 2) Click the row in the main page; capture a popup/new tab if it opens.
+        try:
+            loc = self._locate_row(fax)
+            if loc is not None:
+                try:
+                    with self.context.expect_page(timeout=6000) as pop:
+                        loc.click()
+                    return pop.value, "click-popup"
+                except Exception:
+                    self.page.wait_for_timeout(800)
+                    return self.page, "click-inline"
         except Exception:
-            return fax.label, url, ""
+            pass
+        return None, ""
 
-    def try_download_pdf(self, fax: FaxItem, detail_html: str = "") -> bytes | None:
-        """Fetch the PDF using the authenticated browser session, if findable."""
-        candidates: list[str] = []
-        base = fax.detail_url or self.page.url
-        for m in re.finditer(r"""(?is)(?:href|src|action)\s*=\s*["']([^"']+)["']""", detail_html or ""):
+    def _locate_row(self, fax: FaxItem):
+        snippet = (fax.label or "").split(" - ")[0][:30].strip()
+        if not snippet:
+            return None
+        for frame in self.page.frames:
+            try:
+                row = frame.locator("table tr", has_text=snippet).first
+                if row and row.count() > 0:
+                    link = row.locator("a[href], [onclick]").first
+                    return link if link.count() > 0 else row
+            except Exception:
+                continue
+        return None
+
+    def _file_links_in(self, html: str, base: str) -> list[str]:
+        out = []
+        for m in re.finditer(r"""(?is)(?:href|src|data|action)\s*=\s*["']([^"']+)["']""", html or ""):
             href = m.group(1)
-            if any(h in href.lower() for h in PDF_LINK_HINTS) and "logout" not in href.lower():
-                candidates.append(urljoin(base, html_lib.unescape(href)))
-        if fax.detail_url:
-            candidates.append(fax.detail_url)
+            low = href.lower()
+            if any(h in low for h in FILE_LINK_HINTS) and not any(d in low for d in LINK_DENY):
+                out.append(urljoin(base, html_lib.unescape(href)))
+        return out
 
-        for url in list(dict.fromkeys(candidates))[:8]:
+    def _download_first_file(self, urls: list[str]) -> tuple[bytes | None, str]:
+        for url in list(dict.fromkeys(urls))[:12]:
             try:
                 resp = self.context.request.get(url, timeout=self.timeout_ms)
                 body = resp.body()
                 ctype = (resp.headers or {}).get("content-type", "").lower()
                 if body[:5] == b"%PDF-" or "application/pdf" in ctype:
-                    return body
+                    return body, "pdf"
+                if "image/tiff" in ctype or body[:2] == b"II" or body[:2] == b"MM":
+                    return body, "tiff"
+                if "image/png" in ctype or body[:8] == b"\x89PNG\r\n\x1a\n":
+                    return body, "png"
+                if "image/jpeg" in ctype or body[:3] == b"\xff\xd8\xff":
+                    return body, "jpg"
             except Exception:
                 continue
-        return None
+        return None, "pdf"
 
     # -- discovery -----------------------------------------------------------
-    def discovery_dump(self) -> Path:
-        """Capture the real post-login structure so selectors can be confirmed.
-
-        This is the artifact to send back if the tool still finds 0 faxes:
-        it contains the actual rendered HTML of every frame, table headers,
-        sample rows, candidate links, and a screenshot.
-        """
+    def discovery_dump(self, probe_document: bool = True) -> Path:
+        """Capture the real post-login structure (and how a document opens)."""
         report = self.debug_dir / "discovery_report.txt"
+        self._load_all_rows()
+        faxes = self._scan_all_frames()
         lines = [
             "ProviderFlow discovery report",
             "=============================",
@@ -351,30 +482,41 @@ class BrowserSession:
             f"Page title: {self.page.title()!r}",
             f"Login form still present: {self._login_form_present()}",
             f"Frame count: {len(self.page.frames)}",
+            f"Fax-like rows detected: {len(faxes)}",
             "",
+            "First rows detected:",
         ]
-        faxes = self._scan_all_frames()
-        lines.append(f"Fax-like rows detected (all frames): {len(faxes)}")
-        for fx in faxes[:10]:
-            lines.append(f"  - id={fx.fax_id} key={fx.session_key or '-'} :: {fx.label[:90]}")
-        lines.append("")
+        for fx in faxes[:8]:
+            lines.append(f"  - id={fx.fax_id} doc_id={fx.doc_id or '-'} open={_redact(fx.open_url) or '-'}")
+            lines.append(f"      label: {fx.label[:110]}")
+
+        # Save the raw HTML of the first few rows so the open/link pattern is visible.
+        for i, fx in enumerate(faxes[:5]):
+            (self.debug_dir / f"row_{i}.html").write_text(fx.raw_html, encoding="utf-8", errors="ignore")
 
         for i, frame in enumerate(self.page.frames):
-            safe = f"frame_{i}"
             try:
-                content = frame.content()
-                (self.debug_dir / f"{safe}.html").write_text(content, encoding="utf-8", errors="ignore")
+                (self.debug_dir / f"frame_{i}.html").write_text(frame.content(), encoding="utf-8", errors="ignore")
             except Exception:
-                content = ""
+                pass
             headers = self._frame_table_headers(frame)
-            links = self._frame_candidate_links(frame)
-            lines.append(f"[Frame {i}] url={_redact(frame.url)}")
             if headers:
-                lines.append("  Table headers: " + " | ".join(headers[:12]))
-            lines.append(f"  Candidate links (quickflow/print/pdf/...): {len(links)}")
-            for href in links[:15]:
-                lines.append(f"    - {_redact(href)}")
-            lines.append("")
+                lines.append("")
+                lines.append(f"[Frame {i}] headers: " + " | ".join(headers[:12]))
+
+        # Open the first document and record exactly how it behaves.
+        if probe_document and faxes:
+            lines += ["", "Document-open probe (first row):"]
+            try:
+                doc = self.fetch_document(faxes[0])
+                lines.append(f"  note: {doc.note}")
+                lines.append(f"  viewer url: {_redact(doc.url)}")
+                lines.append(f"  file downloaded: {bool(doc.pdf_bytes)} ({doc.file_ext})")
+                (self.debug_dir / "first_document_viewer.html").write_text(doc.html, encoding="utf-8", errors="ignore")
+                if doc.pdf_bytes:
+                    (self.debug_dir / f"first_document.{doc.file_ext}").write_bytes(doc.pdf_bytes)
+            except Exception as e:
+                lines.append(f"  probe error: {e}")
 
         report.write_text("\n".join(lines) + "\n", encoding="utf-8")
         self._safe_screenshot("discovery_fullpage.png", full_page=True)
@@ -388,22 +530,6 @@ class BrowserSession:
             ) or []
         except Exception:
             return []
-
-    def _frame_candidate_links(self, frame) -> list[str]:
-        try:
-            raw = frame.evaluate(
-                "() => Array.from(document.querySelectorAll('a[href],[onclick]')).map(e => "
-                "(e.getAttribute('href')||'') + ' ' + (e.getAttribute('onclick')||''))"
-            ) or []
-        except Exception:
-            return []
-        hints = DETAIL_LINK_HINTS + PDF_LINK_HINTS + ("sessionkey", "batchtable")
-        out = []
-        for r in raw:
-            low = r.lower()
-            if any(h in low for h in hints):
-                out.append(r.strip())
-        return out
 
     # -- helpers -------------------------------------------------------------
     def _first_locator(self, selectors: list[str]):
@@ -465,5 +591,5 @@ def _norm(s: str) -> str:
 
 
 def _redact(url: str) -> str:
-    return re.sub(r"(?i)(sessionkey|password|username|token|key|docid|id)=([^&\s]+)",
+    return re.sub(r"(?i)(sessionkey|password|username|token|key|docid|documentid|id)=([^&\s]+)",
                   r"\1=<redacted>", url or "")

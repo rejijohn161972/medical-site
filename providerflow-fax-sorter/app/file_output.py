@@ -62,14 +62,16 @@ def run_dir_for_today(output_base: str) -> Path:
 
 
 def save_fax(output_base: str, patient_name: str, doc_type: str, fax_id: str,
-             pdf_bytes: bytes | None, text_fallback: str) -> tuple[Path, Path]:
-    """Create the patient folder and write the PDF (or text fallback)."""
+             pdf_bytes: bytes | None, text_fallback: str,
+             file_ext: str = "pdf") -> tuple[Path, Path]:
+    """Create the patient folder and write the document (or text fallback)."""
     folder = run_dir_for_today(output_base) / safe_folder_name(patient_name)
     folder.mkdir(parents=True, exist_ok=True)
 
     base = safe_file_part(f"{safe_folder_name(patient_name)}_{doc_type}_{fax_id}")
     if pdf_bytes:
-        path = folder / f"{base}.pdf"
+        ext = (file_ext or "pdf").lstrip(".") or "pdf"
+        path = folder / f"{base}.{ext}"
         path.write_bytes(pdf_bytes)
     else:
         path = folder / f"{base}.txt"

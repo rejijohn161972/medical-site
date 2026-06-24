@@ -1,9 +1,18 @@
 # ProviderFlow Fax Sorter
 
 Automates the morning fax triage in [ProviderFlow](https://secure.providerflow.com):
-it logs in, reads **all** pending faxes, uses OpenAI to identify the patient and
-document type, downloads each fax, and drops it into a `LASTNAME, FIRSTNAME`
-folder so the VA can drag the already-sorted PDFs into Epic Citrix.
+it logs in, reads **all** rows of the **Pending Documents** table, names each one
+from the patient in the *Description / Fulltext* column (refined by OpenAI),
+**opens each document and copies the file** into a `LASTNAME, FIRSTNAME` folder,
+and writes a CSV summary — so the VA can drag the already-sorted documents into
+Epic Citrix.
+
+The real Pending Documents table has these columns, and the patient name is in
+the Description column (`WILSON, NANCY - Referral`, `KELLEY, TONI - Referral`, …):
+
+```
+Site | Source | Status | Created By | Assigned To | Created Date | Description / Fulltext | Pages
+```
 
 ```
 C:\FaxOutput\2026-06-24\
@@ -127,6 +136,7 @@ Re-create or change the schedule any time by re-running `1_FIRST_TIME_SETUP.bat`
 | `'python' is not recognized` | Reinstall Python with “Add to PATH”, reopen the window. |
 | Login test fails | Log into ProviderFlow in Chrome with the same username/password. If MFA appears, the script can't pass it unattended. |
 | `Found 0 pending fax item(s)` | Run `4_DISCOVERY_TEST.bat` and send the snapshot folder. |
+| Folders are created but contain a `.txt` instead of the document | The document opened but the file link wasn't recognized. The discovery snapshot now opens the first document and saves `first_document_viewer.html` + how it behaved — send that so the exact download path can be wired in. |
 | OpenAI error in the CSV | Check the API key has billing/quota; the run still continues using a local best-guess. |
 | Want to watch it work | Run `2_RUN_NOW.bat` after setting `PF_HEADED=1` in `.env`, or run `python app\main.py --headed`. |
 
