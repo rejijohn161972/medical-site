@@ -1,0 +1,153 @@
+"""First-time setup / reset for the ProviderFlow Fax Sorter.
+
+Prompts for the ProviderFlow login, OpenAI API key, model and output folder;
+installs the Playwright Chromium browser; optionally tests the login; and
+schedules the automatic Monday-Friday 8:45 AM run.
+
+No secret is hard-coded. Everything entered here is stored locally (git-ignored)
+under %LOCALAPPDATA%\\ProviderFlowFaxSorter and in a local .env file.
+"""
+from __future__ import annotations
+
+import getpass
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from config_store import (
+    DEFAULT_BASE_URL, DEFAULT_OUTPUT_DIR, DEFAULT_OPENAI_MODEL,
+    load_config, save_local_config, APPDATA_DIR,
+)
+
+
+def desktop_path() -> Path:
+    return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
+
+
+def write_desktop_button(name: str, target_bat: Path) -> None:
+    d = desktop_path()
+    if not d.exists():
+        return
+    (d / name).write_text(f'@echo off\r\ncall "{target_bat}"\r\n', encoding="utf-8")
+
+
+def install_playwright_browser() -> bool:
+    print("Installing the Chromium browser engine (one time, may take a minute)...")
+    try:
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        return True
+    except Exception as e:
+        print("Could not install the Chromium engine automatically.")
+        print("Run this once in a terminal:  python -m playwright install chromium")
+        print("Details:", e)
+        return False
+
+
+def create_task(root_dir: Path) -> bool:
+    vbs = root_dir / "app" / "run_hidden.vbs"
+    cmd = [
+        "schtasks", "/Create",
+        "/TN", "ProviderFlow Fax Sorter 845AM",
+        "/SC", "WEEKLY",
+        "/D", "MON,TUE,WED,THU,FRI",
+        "/ST", "08:45",
+        "/TR", f'wscript.exe "{vbs}"',
+        "/F",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print("Could not create the Windows automatic schedule.")
+        print(result.stderr or result.stdout)
+        return False
+    return True
+
+
+def main() -> int:
+    print("ProviderFlow Fax Sorter - Setup")
+    print("===============================")
+    print("Run this the first time, or any time the login/OpenAI settings change.\n")
+
+    existing = {}
+    try:
+        existing = load_config()
+    except Exception:
+        existing = {}
+
+    ex_user = (existing.get("providerflow_username") or "").strip()
+    ex_pass = (existing.get("providerflow_password") or "").strip()
+    ex_key = (existing.get("openai_api_key") or "").strip()
+    ex_out = (existing.get("output_dir") or DEFAULT_OUTPUT_DIR).strip()
+    ex_model = (existing.get("openai_model") or DEFAULT_OPENAI_MODEL).strip()
+
+    up = "ProviderFlow username" + (f" [Enter = {ex_user}]" if ex_user else "")
+    username = input(up + ": ").strip() or ex_user
+    if not username:
+        print("Username is required.")
+        return 1
+
+    pp = "ProviderFlow password" + (" [Enter = keep saved]" if ex_pass else "")
+    password = getpass.getpass(pp + ": ").strip() or ex_pass
+    if not password:
+        print("Password is required.")
+        return 1
+
+    kp = "OpenAI API key (sk-...)" + (" [Enter = keep saved]" if ex_key else "")
+    api_key = getpass.getpass(kp + ": ").strip() or ex_key
+    if not api_key:
+        print("OpenAI API key is required.")
+        return 1
+
+    model = input(f"OpenAI model [Enter = {ex_model}]: ").strip() or ex_model
+    out = input(f"Output folder [Enter = {ex_out}]: ").strip() or ex_out
+    Path(out).mkdir(parents=True, exist_ok=True)
+
+    root_dir = Path(__file__).resolve().parent.parent
+    install_playwright_browser()
+
+    # Optional login test using the real browser.
+    print("\nTest the ProviderFlow login now? It briefly opens a browser.")
+    if input("Test login? [Y/n]: ").strip().lower() in ("", "y", "yes"):
+        try:
+            from browser_session import BrowserSession
+            debug_dir = APPDATA_DIR / "debug" / "setup_login_test"
+            with BrowserSession(DEFAULT_BASE_URL, username, password, debug_dir, headed=True) as s:
+                s.login()
+                faxes = s.collect_pending_faxes(limit=3)
+                s.discovery_dump()
+            print(f"Login test PASSED. Sample rows read: {len(faxes)}.")
+            if not faxes:
+                print("Note: login worked but 0 rows were read. A discovery snapshot was saved to:")
+                print(f"  {debug_dir}")
+        except Exception as e:
+            print("\nLogin test FAILED:", e)
+            print("Open ProviderFlow in Chrome and confirm the same username/password works.")
+            print(f"Diagnostic snapshot (if any): {APPDATA_DIR / 'debug' / 'setup_login_test'}")
+            if input("Save settings anyway? [y/N]: ").strip().lower() not in ("y", "yes"):
+                print("Nothing saved.")
+                return 1
+
+    save_local_config(
+        base_url=DEFAULT_BASE_URL, username=username, password=password,
+        openai_api_key=api_key, openai_model=model, output_dir=out, headed=False,
+    )
+    print("\nSettings saved (locally, not in the repository).")
+
+    if create_task(root_dir):
+        print("Automatic run scheduled: Monday-Friday at 8:45 AM.")
+    else:
+        print("Automatic schedule NOT created. You can still run 2_RUN_NOW.bat manually.")
+
+    write_desktop_button("RUN FAX SORTER NOW.bat", root_dir / "2_RUN_NOW.bat")
+    write_desktop_button("OPEN SORTED FAXES.bat", root_dir / "3_OPEN_SORTED_FAXES.bat")
+
+    print("\nSETUP COMPLETE.")
+    print("  Run now:        2_RUN_NOW.bat")
+    print("  Open folders:   3_OPEN_SORTED_FAXES.bat")
+    print("  Diagnose:       4_DISCOVERY_TEST.bat")
+    print("The machine must be on, online, and awake at 8:45 AM for the automatic run.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

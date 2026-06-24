@@ -1,0 +1,17 @@
+# Secrets and local config — NEVER commit these
+.env
+config.json
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime / output — may contain PHI, must never be committed
+debug/
+output/
+FaxOutput/
+last_run.log
+*.pdf
