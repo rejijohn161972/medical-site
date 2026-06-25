@@ -161,7 +161,8 @@ def main() -> int:
             with BrowserSession(DEFAULT_BASE_URL, username, password, debug_dir, headed=True) as s:
                 s.login()
                 faxes = s.collect_pending_faxes(limit=3)
-                s.discovery_dump()
+                # Quick snapshot only; do NOT open a document here (keeps setup fast).
+                s.discovery_dump(probe_document=False)
             print(f"Login test PASSED. Sample rows read: {len(faxes)}.")
             if not faxes:
                 print("Note: login worked but 0 rows were read. A discovery snapshot was saved to:")

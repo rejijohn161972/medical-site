@@ -390,13 +390,12 @@ class BrowserSession:
         self._capture = []
         try:
             viewer = self.context.new_page()
-            try:
-                viewer.goto(open_url, wait_until="networkidle", timeout=self.timeout_ms)
-            except Exception:
-                viewer.goto(open_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-            viewer.wait_for_timeout(1200)
-            # Scroll (page + frames) so any lazily-loaded pages request their images.
-            for _ in range(10):
+            # domcontentloaded only — never networkidle (this app holds connections
+            # open, which would stall). A fixed settle wait lets page images load.
+            viewer.goto(open_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            viewer.wait_for_timeout(1500)
+            # A few quick scrolls so any lazily-loaded pages request their images.
+            for _ in range(6):
                 try:
                     viewer.mouse.wheel(0, 4000)
                 except Exception:
@@ -406,8 +405,8 @@ class BrowserSession:
                         fr.evaluate("() => window.scrollBy(0, document.body ? document.body.scrollHeight : 2000)")
                     except Exception:
                         pass
-                viewer.wait_for_timeout(350)
-            viewer.wait_for_timeout(800)
+                viewer.wait_for_timeout(250)
+            viewer.wait_for_timeout(500)
         except Exception:
             return None, "pdf", ""
         finally:
@@ -841,11 +840,17 @@ class BrowserSession:
         return "|".join(_norm(r.label) for r in rows[:5])
 
     def _wait_idle(self) -> None:
-        for state in ("load", "networkidle"):
-            try:
-                self.page.wait_for_load_state(state, timeout=self.timeout_ms)
-            except Exception:
-                pass
+        # 'load' can use the full timeout, but 'networkidle' must be short: this
+        # old PHP app keeps connections open, so networkidle would otherwise stall
+        # for the whole timeout and look "stuck". Login is confirmed separately.
+        try:
+            self.page.wait_for_load_state("load", timeout=self.timeout_ms)
+        except Exception:
+            pass
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
 
     def _dump_html(self, name: str) -> None:
         self._dump_html_for(self.page, name)
