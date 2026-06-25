@@ -28,6 +28,7 @@ from __future__ import annotations
 import html as html_lib
 import re
 import hashlib
+import struct
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -57,8 +58,12 @@ OPEN_LINK_HINTS = ("quickflow", "sessionkey", "displaysession", "viewfile",
 # Things that are never the document (avoid clicking these).
 LINK_DENY = ("logout", "log out", "javascript:void", "#", "mailto:", "preferences")
 # Likely file endpoints when fetching the actual document bytes.
-FILE_LINK_HINTS = ("pdf", "viewfile", "getfile", "showfile", "downloadfile",
-                   "download", "file=", "fileid", "print", "page=", "image", "tiff")
+FILE_LINK_HINTS = ("pdf", "tiff", "viewfile", "getfile", "showfile", "downloadfile",
+                   "fileid", "getpage", "getimage", "docimage", "faximage", "viewdoc")
+# Static/decorative assets that are NEVER the fax (logo, css, icons, ...).
+ASSET_DENY = ("logo", "header", "banner", "footer", "icon", "sprite", "favicon",
+              "spacer", "button", "/css/", "/js/", "/images/", "/img/", "/assets/",
+              "/static/", "/themes/", "powered", ".css", ".js", ".svg", ".woff", ".ico")
 
 # Returns rich, lightweight info for every table row in a frame.
 ROW_SCAN_JS = r"""
@@ -124,6 +129,7 @@ class BrowserSession:
         self._browser = None
         self.context = None
         self.page = None
+        self._capture: list[str] = []  # doc-like response URLs seen during a fetch
 
     # -- lifecycle -----------------------------------------------------------
     def __enter__(self) -> "BrowserSession":
@@ -141,6 +147,7 @@ class BrowserSession:
                         "(KHTML, like Gecko) Chrome/126 Safari/537.36"),
         )
         self.context.set_default_timeout(self.timeout_ms)
+        self.context.on("response", self._on_response)
         self.page = self.context.new_page()
         return self
 
@@ -151,6 +158,23 @@ class BrowserSession:
                     closer.close()
             except Exception:
                 pass
+
+    def _on_response(self, response) -> None:
+        """Record document-like responses (PDF/image) so the real fax can be
+        grabbed from network traffic instead of guessing at <img> tags."""
+        try:
+            low = (response.url or "").lower()
+            if any(d in low for d in ASSET_DENY):
+                return
+            ct = (response.headers or {}).get("content-type", "").lower()
+            if ("application/pdf" in ct or "image/" in ct or "octet-stream" in ct
+                    or low.endswith((".pdf", ".tif", ".tiff"))):
+                if response.url not in self._capture:
+                    self._capture.append(response.url)
+                    if len(self._capture) > 50:
+                        self._capture.pop(0)
+        except Exception:
+            pass
         try:
             if self._pw:
                 self._pw.stop()
@@ -364,6 +388,7 @@ class BrowserSession:
         Text for OpenAI naming comes from the row label (which already holds the
         patient name for triaged rows) and, when needed, the opened viewer.
         """
+        self._capture = []  # collect document responses seen while opening this fax
         pdf_bytes, ext, how = self._download_via_row_actions(fax)
 
         # Fast path: file in hand AND the row already names the patient -> done,
@@ -397,7 +422,7 @@ class BrowserSession:
                 final_url = viewer.url
                 full_html = "\n".join(html_parts)
                 if not pdf_bytes:
-                    pdf_bytes, ext = self._download_first_file(file_links)
+                    pdf_bytes, ext = self._download_first_file(self._capture + file_links)
                     if pdf_bytes:
                         how = "viewer-file"
                     elif not self.headed:
@@ -558,27 +583,37 @@ class BrowserSession:
         for m in re.finditer(r"""(?is)(?:href|src|data|action)\s*=\s*["']([^"']+)["']""", html or ""):
             href = m.group(1)
             low = href.lower()
+            if any(d in low for d in ASSET_DENY):
+                continue
             if any(h in low for h in FILE_LINK_HINTS) and not any(d in low for d in LINK_DENY):
                 out.append(urljoin(base, html_lib.unescape(href)))
         return out
 
     def _download_first_file(self, urls: list[str]) -> tuple[bytes | None, str]:
-        for url in list(dict.fromkeys(urls))[:12]:
+        """Fetch the actual document. Prefer PDF/TIFF; accept a real page image
+        but never a logo/banner/icon (the cause of 'same image in every folder')."""
+        best_image = None  # (bytes, ext) used only if no PDF/TIFF is found
+        for url in list(dict.fromkeys(urls))[:20]:
+            if any(d in url.lower() for d in ASSET_DENY):
+                continue
             try:
                 resp = self.context.request.get(url, timeout=self.timeout_ms)
                 body = resp.body()
                 ctype = (resp.headers or {}).get("content-type", "").lower()
-                if body[:5] == b"%PDF-" or "application/pdf" in ctype:
-                    return body, "pdf"
-                if "image/tiff" in ctype or body[:2] == b"II" or body[:2] == b"MM":
-                    return body, "tiff"
-                if "image/png" in ctype or body[:8] == b"\x89PNG\r\n\x1a\n":
-                    return body, "png"
-                if "image/jpeg" in ctype or body[:3] == b"\xff\xd8\xff":
-                    return body, "jpg"
             except Exception:
                 continue
-        return None, "pdf"
+            if not body:
+                continue
+            if body[:5] == b"%PDF-" or "application/pdf" in ctype:
+                return body, "pdf"
+            if "image/tiff" in ctype or body[:2] in (b"II", b"MM"):
+                return body, "tiff"
+            is_png = "image/png" in ctype or body[:8] == b"\x89PNG\r\n\x1a\n"
+            is_jpg = "image/jpeg" in ctype or body[:3] == b"\xff\xd8\xff"
+            if (is_png or is_jpg) and len(body) > 8000 and not _looks_like_decorative_image(body):
+                if best_image is None:
+                    best_image = (body, "png" if is_png else "jpg")
+        return best_image if best_image else (None, "pdf")
 
     # -- discovery -----------------------------------------------------------
     def discovery_dump(self, probe_document: bool = True) -> Path:
@@ -761,6 +796,43 @@ def _first_match(patterns: list[str], text: str) -> str:
         if m:
             return m.group(1)
     return ""
+
+
+def _image_dims(data: bytes):
+    """(width, height) for PNG/JPEG, else None — read from the header bytes only."""
+    try:
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            w, h = struct.unpack(">II", data[16:24])
+            return int(w), int(h)
+        if data[:2] == b"\xff\xd8":  # JPEG: scan for a Start-Of-Frame marker
+            i, n = 2, len(data)
+            while i + 9 < n:
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                    return int(w), int(h)
+                i += 2 + struct.unpack(">H", data[i + 2:i + 4])[0]
+    except Exception:
+        return None
+    return None
+
+
+def _looks_like_decorative_image(data: bytes) -> bool:
+    """True for logos/headers/banners/icons: very wide-and-short, or tiny.
+
+    A faxed page is portrait or roughly square; the ProviderFlow header logo is
+    ~1507x151 (width >= 3x height), which this rejects.
+    """
+    dims = _image_dims(data)
+    if not dims:
+        return False
+    w, h = dims
+    if w <= 0 or h <= 0:
+        return False
+    return w >= 3 * h or (w < 200 and h < 200)
 
 
 def _ext_from_bytes(data: bytes, suggested: str = "") -> str:
