@@ -18,6 +18,7 @@ from pathlib import Path
 from config_store import (
     DEFAULT_BASE_URL, DEFAULT_OUTPUT_DIR, DEFAULT_OPENAI_MODEL,
     load_config, save_local_config, APPDATA_DIR,
+    embedded_openai_api_key, _key_file_value,
 )
 
 
@@ -92,11 +93,20 @@ def main() -> int:
         print("Password is required.")
         return 1
 
-    kp = "OpenAI API key (sk-...)" + (" [Enter = keep saved]" if ex_key else "")
-    api_key = getpass.getpass(kp + ": ").strip() or ex_key
-    if not api_key:
-        print("OpenAI API key is required.")
-        return 1
+    # The OpenAI key may already be provided by the build (embedded / key file)
+    # or a prior setup. If so, the VA does not need to type anything.
+    build_key = (embedded_openai_api_key() or _key_file_value()).strip()
+    if ex_key:
+        api_key = ex_key
+        if api_key == build_key and build_key:
+            print("OpenAI key: already configured in this build (no entry needed).")
+        else:
+            print("OpenAI key: using the saved key (no entry needed).")
+    else:
+        api_key = getpass.getpass("OpenAI API key (sk-...): ").strip()
+        if not api_key:
+            print("OpenAI API key is required.")
+            return 1
 
     model = input(f"OpenAI model [Enter = {ex_model}]: ").strip() or ex_model
     out = input(f"Output folder [Enter = {ex_out}]: ").strip() or ex_out
@@ -127,9 +137,12 @@ def main() -> int:
                 print("Nothing saved.")
                 return 1
 
+    # Don't persist a build-provided key into local config/.env, so the embedded
+    # key (or openai_key.txt) stays the single rotatable source of truth.
+    persist_key = "" if (build_key and api_key == build_key) else api_key
     save_local_config(
         base_url=DEFAULT_BASE_URL, username=username, password=password,
-        openai_api_key=api_key, openai_model=model, output_dir=out, headed=False,
+        openai_api_key=persist_key, openai_model=model, output_dir=out, headed=False,
     )
     print("\nSettings saved (locally, not in the repository).")
 

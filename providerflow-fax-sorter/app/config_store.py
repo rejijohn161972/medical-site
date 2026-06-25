@@ -12,6 +12,7 @@ letting a non-technical user run a simple setup once.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,34 @@ CONFIG_PATH = APPDATA_DIR / "config.json"
 # Project root (folder that contains this app/ package).
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENV_PATH = PROJECT_ROOT / ".env"
+
+# The clinic's OpenAI key can be EMBEDDED in the distributed build so the VA
+# never types it. This stays EMPTY in source control (no secret in git); the
+# real value is injected only into the private build handed to the clinic.
+# Resolution priority: OPENAI_API_KEY env > .env/config.json > openai_key.txt
+# > this embedded key. To rotate, drop a new key into openai_key.txt — no code
+# edit needed — or replace the embedded string below.
+EMBEDDED_OPENAI_API_KEY_B64 = ""
+KEY_FILE_CANDIDATES = (PROJECT_ROOT / "openai_key.txt", APPDATA_DIR / "openai_key.txt")
+
+
+def embedded_openai_api_key() -> str:
+    try:
+        return base64.b64decode((EMBEDDED_OPENAI_API_KEY_B64 or "").encode("ascii")).decode("utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _key_file_value() -> str:
+    for p in KEY_FILE_CANDIDATES:
+        try:
+            if p.exists():
+                val = p.read_text(encoding="utf-8").strip()
+                if val:
+                    return val
+        except Exception:
+            continue
+    return ""
 
 
 def ensure_appdata() -> None:
@@ -69,7 +98,8 @@ def load_config() -> dict:
         "base_url": pick("PF_BASE_URL", "base_url", DEFAULT_BASE_URL),
         "providerflow_username": pick("PF_USERNAME", "providerflow_username"),
         "providerflow_password": pick("PF_PASSWORD", "providerflow_password"),
-        "openai_api_key": pick("OPENAI_API_KEY", "openai_api_key"),
+        "openai_api_key": (pick("OPENAI_API_KEY", "openai_api_key")
+                           or _key_file_value() or embedded_openai_api_key()),
         "openai_model": pick("OPENAI_MODEL", "openai_model", DEFAULT_OPENAI_MODEL),
         "output_dir": pick("OUTPUT_DIR", "output_dir", DEFAULT_OUTPUT_DIR),
     }

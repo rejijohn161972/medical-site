@@ -1,6 +1,7 @@
 # Secrets and local config — NEVER commit these
 .env
 config.json
+openai_key.txt
 *.key
 
 # Python
