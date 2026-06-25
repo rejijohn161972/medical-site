@@ -87,10 +87,12 @@ It saves, to a timestamped folder under
 - all candidate links (`quickflow` / `sessionkey` / `print` / `pdf` / …),
 - a full-page screenshot.
 
-Zip that folder and send it to whoever maintains this tool. With the **real**
-DOM in hand, the row/PDF selectors can be finalized precisely instead of
-guessed. (A discovery snapshot is also saved automatically on every normal run,
-so a 0-result morning is always diagnosable after the fact.)
+That folder also contains **`SHARE_THIS_diagnostics.txt`** — a PHI-safe summary
+(no patient names; URLs/ids redacted) listing the row count, table headers, the
+detected Export-menu items, and whether the first document downloaded. **Paste
+that one back** for a quick fix. Send the full zipped folder only if deeper
+detail is needed. (A discovery snapshot is also saved automatically on every
+normal run, so a 0-result morning is always diagnosable after the fact.)
 
 ---
 

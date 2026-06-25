@@ -65,10 +65,12 @@ def run(limit: int | None = None, discovery_only: bool = False, headed: bool | N
 
         if discovery_only:
             report = session.discovery_dump()
-            print("\nDiscovery report saved:")
-            print(f"  {report}")
-            print(f"  (full folder: {debug_dir})")
-            print("No faxes were processed. Send that folder back if rows look wrong.")
+            safe = report.parent / "SHARE_THIS_diagnostics.txt"
+            print("\nDiscovery complete. Two files to look at:")
+            print(f"  Full report:     {report}")
+            print(f"  SAFE to paste:   {safe}")
+            print(f"  (full folder:    {debug_dir})")
+            print("\nNo faxes were processed. Paste 'SHARE_THIS_diagnostics.txt' — it has no patient names.")
             log_line(f"Discovery report: {report}")
             return 0
 

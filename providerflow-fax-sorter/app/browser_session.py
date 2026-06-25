@@ -578,6 +578,13 @@ class BrowserSession:
         report = self.debug_dir / "discovery_report.txt"
         self._load_all_rows()
         faxes = self._scan_all_frames()
+        # Structured, PHI-free diagnostics collected as we go (for SHARE_THIS file).
+        headers_all: list[str] = []
+        gear_found = False
+        gear_items: list[str] = []
+        probe_note = "(not run)"
+        probe_file_ok = False
+        probe_file_ext = ""
         lines = [
             "ProviderFlow discovery report",
             "=============================",
@@ -605,6 +612,7 @@ class BrowserSession:
                 pass
             headers = self._frame_table_headers(frame)
             if headers:
+                headers_all += headers
                 lines.append("")
                 lines.append(f"[Frame {i}] headers: " + " | ".join(headers[:12]))
 
@@ -614,7 +622,8 @@ class BrowserSession:
             try:
                 row = self._locate_full_row(faxes[0])
                 toggle = self._find_actions_toggle(row) if row is not None else None
-                lines.append(f"  gear/actions control found: {toggle is not None}")
+                gear_found = toggle is not None
+                lines.append(f"  gear/actions control found: {gear_found}")
                 if toggle is not None:
                     toggle.click()
                     self.page.wait_for_timeout(500)
@@ -630,7 +639,8 @@ class BrowserSession:
                             ) or []
                         except Exception:
                             continue
-                    for it in list(dict.fromkeys(items))[:25]:
+                    gear_items = list(dict.fromkeys(items))[:25]
+                    for it in gear_items:
                         lines.append("    - " + _redact(it))
                     self._dump_html("row_actions_menu.html")
             except Exception as e:
@@ -641,17 +651,44 @@ class BrowserSession:
             lines += ["", "Document-open probe (first row):"]
             try:
                 doc = self.fetch_document(faxes[0])
+                probe_note = doc.note
+                probe_file_ok = bool(doc.pdf_bytes)
+                probe_file_ext = doc.file_ext
                 lines.append(f"  note: {doc.note}")
                 lines.append(f"  viewer url: {_redact(doc.url)}")
-                lines.append(f"  file downloaded: {bool(doc.pdf_bytes)} ({doc.file_ext})")
+                lines.append(f"  file downloaded: {probe_file_ok} ({doc.file_ext})")
                 (self.debug_dir / "first_document_viewer.html").write_text(doc.html, encoding="utf-8", errors="ignore")
                 if doc.pdf_bytes:
                     (self.debug_dir / f"first_document.{doc.file_ext}").write_bytes(doc.pdf_bytes)
             except Exception as e:
-                lines.append(f"  probe error: {e}")
+                probe_note = f"probe error: {e}"
+                lines.append(f"  {probe_note}")
 
         report.write_text("\n".join(lines) + "\n", encoding="utf-8")
         self._safe_screenshot("discovery_fullpage.png", full_page=True)
+
+        # PHI-safe summary the user can paste back without exposing patient names.
+        safe = [
+            "ProviderFlow diagnostics — SAFE TO SHARE",
+            "(no patient names or document text below; URLs/ids redacted)",
+            "=========================================================",
+            f"Generated:               {datetime.now():%Y-%m-%d %H:%M:%S}",
+            f"Login form still present: {self._login_form_present()}",
+            f"Frames on page:          {len(self.page.frames)}",
+            f"Pending rows detected:   {len(faxes)}",
+            f"Table headers:           {' | '.join(dict.fromkeys(headers_all))[:300] or '(none)'}",
+            "",
+            f"Gear/Export control found: {gear_found}",
+            "Export-menu items detected:",
+        ]
+        safe += ["  - " + _scrub(it) for it in gear_items] or ["  (none)"]
+        safe += [
+            "",
+            "First-document probe:",
+            f"  outcome:        {_scrub(probe_note)}",
+            f"  file obtained:  {probe_file_ok}" + (f" ({probe_file_ext})" if probe_file_ok else ""),
+        ]
+        (self.debug_dir / "SHARE_THIS_diagnostics.txt").write_text("\n".join(safe) + "\n", encoding="utf-8")
         return report
 
     def _frame_table_headers(self, frame) -> list[str]:
@@ -741,3 +778,8 @@ def _norm(s: str) -> str:
 def _redact(url: str) -> str:
     return re.sub(r"(?i)(sessionkey|password|username|token|key|docid|documentid|id)=([^&\s]+)",
                   r"\1=<redacted>", url or "")
+
+
+def _scrub(text: str) -> str:
+    """Redact URLs/ids AND strip any 'LASTNAME, FIRSTNAME' so a line is safe to share."""
+    return NAME_RE.sub("<name>", _redact(text or ""))
