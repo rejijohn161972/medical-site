@@ -14,14 +14,20 @@ the Description column (`WILSON, NANCY - Referral`, `KELLEY, TONI - Referral`, �
 Site | Source | Status | Created By | Assigned To | Created Date | Description / Fulltext | Pages
 ```
 
+A new dated folder is created each day, and each patient folder is named
+`LASTNAME, FIRSTNAME - Type`. If the reason can't be determined it's
+`- Miscellaneous`. ProviderFlow is re-scanned **every hour from 8:45 AM to
+4:45 PM, Mon–Fri**, and only *new* faxes are added (no duplicates).
+
 ```
-C:\FaxOutput\2026-06-24\
-├── WILSON, NANCY\        WILSON,_NANCY_referral_<id>.pdf
-├── KELLEY, TONI\         KELLEY,_TONI_referral_<id>.pdf
-├── MORGAN, SALLY\        MORGAN,_SALLY_referral_<id>.pdf
-├── _UNKNOWN\             (anything the AI couldn't identify)
-├── run_summary_0845.csv  (status of every fax this run)
-└── TODAY_SHORT_MESSAGE.txt
+C:\FaxOutput\2026-06-24\                    (new dated folder each day)
+├── Wilson, Nancy - Referral\              Wilson,_Nancy_referral_<id>.pdf
+├── Kelley, Toni - Referral\               ...
+├── James, Rick - Insurance Information\   ...
+├── Fry, David - Miscellaneous\            (reason was unclear)
+├── _UNKNOWN\                              (patient couldn't be identified)
+├── run_summary_2026-06-24.csv             (one daily log, appended each hour)
+└── TODAY_SHORT_MESSAGE.txt                (today's folder list)
 ```
 
 ---
@@ -96,14 +102,18 @@ normal run, so a 0-result morning is always diagnosable after the fact.)
 
 ---
 
-## The automatic 8:45 AM schedule
+## The automatic hourly schedule
 
-Setup creates a Windows Task Scheduler job named **“ProviderFlow Fax Sorter
-845AM”** that runs `app\run_hidden.vbs` (which runs the sorter invisibly) every
-Mon–Fri at 08:45.
+Setup creates a Windows Task Scheduler job named **“ProviderFlow Fax Sorter”**
+that runs `app\run_hidden.vbs` (invisibly) **every hour at :45, from 08:45
+through 16:45 (4:45 PM), Monday–Friday** — so faxes that arrive during the day
+get sorted within the hour.
 
-- View/edit it in **Task Scheduler** (`taskschd.msc`).
-- The machine must be **on, online, and awake** at 8:45 AM.
+- Each run sorts only **new** faxes; a persistent ledger
+  (`%LOCALAPPDATA%\ProviderFlowFaxSorter\processed_faxes.json`) prevents
+  re-creating folders for faxes already handled earlier that day.
+- View/edit the schedule in **Task Scheduler** (`taskschd.msc`).
+- The machine must be **on, online, and awake** during 8:45 AM–4:45 PM.
 - Scheduled-run output is logged to
   `%LOCALAPPDATA%\ProviderFlowFaxSorter\scheduled.log`.
 

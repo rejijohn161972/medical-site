@@ -23,8 +23,13 @@ SYSTEM_PROMPT = (
     "Identify the patient the document is ABOUT — not the doctor, sender, "
     "clinic, or facility. Return the patient name as 'LASTNAME, FIRSTNAME' "
     "when known, otherwise 'UNKNOWN'. Choose document_type only from the "
-    "allowed list. Correct an obvious OCR error only when the correction is "
-    "very clear. Do not invent a name or DOB."
+    "allowed list. document_type guide: referral (a referral or authorization "
+    "request to see a provider), labs (laboratory results), imaging (radiology, "
+    "X-ray, CT, MRI, ultrasound), consult (consult or progress notes), "
+    "prescription (medication/Rx), insurance (insurance card, eligibility, "
+    "benefits, coverage, or explanation of benefits/EOB), miscellaneous "
+    "(anything else, or when the reason is unclear). Correct an obvious OCR "
+    "error only when the correction is very clear. Do not invent a name or DOB."
 )
 
 # Strict JSON schema for OpenAI Structured Outputs.
@@ -41,7 +46,7 @@ EXTRACTION_SCHEMA = {
         },
         "document_type": {
             "type": "string",
-            "enum": ["labs", "referral", "imaging", "consult", "prescription", "miscellaneous"],
+            "enum": ["labs", "referral", "imaging", "consult", "prescription", "insurance", "miscellaneous"],
         },
         "confidence": {
             "type": "string",
@@ -157,6 +162,9 @@ def _normalize(d: dict) -> dict:
         "image": "imaging", "imaging": "imaging", "radiology": "imaging",
         "consult": "consult", "consultation": "consult", "note": "consult",
         "prescription": "prescription", "rx": "prescription",
+        "insurance": "insurance", "insurance information": "insurance",
+        "insurance card": "insurance", "eob": "insurance", "eligibility": "insurance",
+        "benefits": "insurance", "coverage": "insurance",
         "other": "miscellaneous", "misc": "miscellaneous", "miscellaneous": "miscellaneous",
     }
     doc = doc_map.get(doc, "miscellaneous")
@@ -219,6 +227,10 @@ def guess_doc_type(text: str) -> str:
     if any(x in low for x in ["creatinine", "bun", "glucose", "hemoglobin", "potassium",
                               "sodium", "specimen", "labcorp", "quest", "reference range"]):
         return "labs"
+    if any(x in low for x in ["insurance", "policy number", "member id", "group number",
+                              "subscriber", "explanation of benefits", "eob", "eligibility",
+                              "coverage", "payer", "copay", "deductible"]):
+        return "insurance"
     if any(x in low for x in ["refer", "referral", "authorization", "consult requested"]):
         return "referral"
     if any(x in low for x in ["ct ", "mri", "ultrasound", "x-ray", "radiology", "impression", "findings"]):

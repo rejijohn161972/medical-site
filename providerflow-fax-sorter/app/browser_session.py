@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import html as html_lib
 import re
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -90,6 +91,13 @@ class FaxItem:
     onclick: str = ""                # combined onclick handlers from the row
     frame_url: str = ""
     raw_html: str = field(default="", repr=False)
+
+    @property
+    def dedup_key(self) -> str:
+        """A stable id for this fax, so hourly re-scans don't re-sort it."""
+        if self.doc_id:
+            return "id:" + self.doc_id
+        return "h:" + hashlib.sha1((self.label or "").encode("utf-8", "ignore")).hexdigest()[:16]
 
 
 @dataclass

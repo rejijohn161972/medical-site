@@ -45,14 +45,23 @@ def install_playwright_browser() -> bool:
         return False
 
 
+TASK_NAME = "ProviderFlow Fax Sorter"
+
+
 def create_task(root_dir: Path) -> bool:
     vbs = root_dir / "app" / "run_hidden.vbs"
+    # Remove earlier task versions so schedules don't stack up.
+    for old in (TASK_NAME, "ProviderFlow Fax Sorter 845AM"):
+        subprocess.run(["schtasks", "/Delete", "/TN", old, "/F"], capture_output=True, text=True)
+    # Run every hour at :45 from 08:45 through 16:45 (4:45 PM), Monday-Friday.
     cmd = [
         "schtasks", "/Create",
-        "/TN", "ProviderFlow Fax Sorter 845AM",
+        "/TN", TASK_NAME,
         "/SC", "WEEKLY",
         "/D", "MON,TUE,WED,THU,FRI",
         "/ST", "08:45",
+        "/RI", "60",        # repeat every 60 minutes...
+        "/DU", "0008:05",   # ...for 8h05m, so the last run is 16:45
         "/TR", f'wscript.exe "{vbs}"',
         "/F",
     ]
@@ -147,7 +156,7 @@ def main() -> int:
     print("\nSettings saved (locally, not in the repository).")
 
     if create_task(root_dir):
-        print("Automatic run scheduled: Monday-Friday at 8:45 AM.")
+        print("Automatic runs scheduled: every hour at :45, 8:45 AM to 4:45 PM, Monday-Friday.")
     else:
         print("Automatic schedule NOT created. You can still run 2_RUN_NOW.bat manually.")
 
@@ -158,7 +167,7 @@ def main() -> int:
     print("  Run now:        2_RUN_NOW.bat")
     print("  Open folders:   3_OPEN_SORTED_FAXES.bat")
     print("  Diagnose:       4_DISCOVERY_TEST.bat")
-    print("The machine must be on, online, and awake at 8:45 AM for the automatic run.")
+    print("The machine must be on, online, and awake during 8:45 AM-4:45 PM for the hourly runs.")
     return 0
 
 

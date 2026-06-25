@@ -48,6 +48,32 @@ def safe_folder_name(name: str) -> str:
     return name or UNKNOWN_FOLDER
 
 
+DOC_TYPE_LABELS = {
+    "referral": "Referral",
+    "labs": "Labs",
+    "imaging": "Imaging",
+    "consult": "Consult",
+    "prescription": "Prescription",
+    "insurance": "Insurance Information",
+    "miscellaneous": "Miscellaneous",
+}
+
+
+def doc_type_label(doc_type: str) -> str:
+    """Human folder label for a document type; anything unknown -> Miscellaneous."""
+    return DOC_TYPE_LABELS.get((doc_type or "").strip().lower(), "Miscellaneous")
+
+
+def patient_folder_name(patient_name: str, doc_type: str) -> str:
+    """Folder name like 'Bowie, John - Referral' (or '_UNKNOWN' if no patient)."""
+    base = safe_folder_name(patient_name)
+    if base == UNKNOWN_FOLDER:
+        return UNKNOWN_FOLDER
+    name = f"{base} - {doc_type_label(doc_type)}"
+    name = re.sub(r"[\\/:*?\"<>|]+", " ", name)
+    return re.sub(r"\s+", " ", name).strip()
+
+
 def safe_file_part(s: str) -> str:
     s = re.sub(r"[\\/:*?\"<>|]+", "_", s or "")
     s = re.sub(r"\s+", "_", s).strip("_")
@@ -65,7 +91,7 @@ def save_fax(output_base: str, patient_name: str, doc_type: str, fax_id: str,
              pdf_bytes: bytes | None, text_fallback: str,
              file_ext: str = "pdf") -> tuple[Path, Path]:
     """Create the patient folder and write the document (or text fallback)."""
-    folder = run_dir_for_today(output_base) / safe_folder_name(patient_name)
+    folder = run_dir_for_today(output_base) / patient_folder_name(patient_name, doc_type)
     folder.mkdir(parents=True, exist_ok=True)
 
     base = safe_file_part(f"{safe_folder_name(patient_name)}_{doc_type}_{fax_id}")
@@ -98,14 +124,34 @@ class RunSummary:
         self.rows.append(full)
 
     def write_csv(self) -> Path:
+        # One CSV per day, appended by each hourly run, so the office has a single
+        # daily log of every fax sorted.
         run_dir = run_dir_for_today(self.output_base)
-        stamp = datetime.now().strftime("%H%M%S")
-        path = run_dir / f"run_summary_{stamp}.csv"
-        with path.open("w", encoding="utf-8", newline="") as f:
+        path = run_dir / f"run_summary_{run_dir.name}.csv"
+        new_file = not path.exists()
+        with path.open("a", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-            writer.writeheader()
+            if new_file:
+                writer.writeheader()
             writer.writerows(self.rows)
         return path
+
+
+def write_today_index(output_base: str) -> Path:
+    """Rewrite TODAY_SHORT_MESSAGE.txt listing every patient folder sorted today.
+
+    Rebuilt from the date folder's subfolders so it always reflects the full day,
+    no matter which hourly run added what.
+    """
+    run_dir = run_dir_for_today(output_base)
+    folders = sorted(p.name for p in run_dir.iterdir() if p.is_dir())
+    msg = run_dir / "TODAY_SHORT_MESSAGE.txt"
+    if folders:
+        body = f"Sorted faxes for {run_dir.name} ({len(folders)} folder(s)):\n\n" + "\n".join(folders) + "\n"
+    else:
+        body = f"No faxes sorted yet for {run_dir.name}.\n"
+    msg.write_text(body, encoding="utf-8")
+    return msg
 
 
 def write_short_message(output_base: str, lines: list[str]) -> Path:
