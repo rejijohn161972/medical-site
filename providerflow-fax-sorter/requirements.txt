@@ -8,5 +8,8 @@ playwright>=1.44.0
 # Used only for the OpenAI Chat Completions call.
 requests>=2.31.0
 
+# Combines the captured fax page images into a single PDF per document.
+Pillow>=10.0.0
+
 # Loads PF_/OPENAI_ settings from a local .env file when present.
 python-dotenv>=1.0.0

@@ -42,14 +42,17 @@ except ImportError:  # pragma: no cover - resolved at first real run / setup
 
 # Patient name in the Description column, e.g. "WILSON, NANCY - Referral".
 NAME_RE = re.compile(r"\b([A-Z][A-Za-z'.\-]+\s*,\s*[A-Z][A-Za-z'.\-]+)")
-# Session / document identifiers seen in links and onclick handlers.
+# Session / document identifiers seen in links and onclick handlers. The
+# QuickFlow document key is a 32-hex string (e.g. sessionkey=16f0469a...4dc).
 ID_PATTERNS = [
+    r"sessionkey=([A-Za-z0-9]{8,})",
     r"loadbatch\(['\"]([A-Za-z0-9]{8,})['\"]",
     r"displaysession\(['\"]?([A-Za-z0-9]{8,})",
     r"displaysession=([A-Za-z0-9]{8,})",
-    r"sessionkey=([A-Za-z0-9]{8,})",
     r"(?:docid|documentid|docguid|fileid)=([A-Za-z0-9]{6,})",
     r"opendoc\(['\"]([A-Za-z0-9]{6,})['\"]",
+    r"['\"]([a-f0-9]{32})['\"]",   # a 32-hex key passed to a JS handler
+    r"\b([a-f0-9]{32})\b",          # last resort: a bare 32-hex key in the row
 ]
 # href fragments that look like "open this document".
 OPEN_LINK_HINTS = ("quickflow", "sessionkey", "displaysession", "viewfile",
@@ -60,10 +63,11 @@ LINK_DENY = ("logout", "log out", "javascript:void", "#", "mailto:", "preference
 # Likely file endpoints when fetching the actual document bytes.
 FILE_LINK_HINTS = ("pdf", "tiff", "viewfile", "getfile", "showfile", "downloadfile",
                    "fileid", "getpage", "getimage", "docimage", "faximage", "viewdoc")
-# Static/decorative assets that are NEVER the fax (logo, css, icons, ...).
-ASSET_DENY = ("logo", "header", "banner", "footer", "icon", "sprite", "favicon",
-              "spacer", "button", "/css/", "/js/", "/images/", "/img/", "/assets/",
-              "/static/", "/themes/", "powered", ".css", ".js", ".svg", ".woff", ".ico")
+# Static/decorative assets that are NEVER the fax. Kept name-specific (not broad
+# "/images/" paths) so document page images served from an images path aren't
+# excluded; the wide-banner/tiny-icon SHAPE check is the real logo filter.
+ASSET_DENY = ("logo", "banner", "favicon", "sprite", "spacer", "powered",
+              "/css/", "/js/", "/themes/", ".css", ".js", ".svg", ".woff", ".woff2", ".ico")
 
 # Returns rich, lightweight info for every table row in a frame.
 ROW_SCAN_JS = r"""
@@ -78,7 +82,7 @@ ROW_SCAN_JS = r"""
     const anchors = Array.from(r.querySelectorAll('a[href]')).map(a => a.getAttribute('href'));
     const clicks = Array.from(r.querySelectorAll('[onclick]')).map(e => e.getAttribute('onclick'));
     let html = r.outerHTML || '';
-    if (html.length > 4000) html = html.slice(0, 4000);
+    if (html.length > 9000) html = html.slice(0, 9000);
     out.push({ text, tdCount, hasTh, hasFilter, anchors, clicks, html });
   }
   return out;
@@ -375,19 +379,88 @@ class BrowserSession:
                     continue
         return False
 
+    def _capture_document_pages(self, open_url: str) -> tuple[bytes | None, str, str]:
+        """Open the QuickFlow viewer and combine its fax page images into one PDF.
+
+        ProviderFlow shows the fax at quickflow/index.php?sessionkey=<key> with
+        each page rendered as an image. We open it, scroll to load every page,
+        capture the page images (and any PDF) from network traffic, and stitch
+        the images into a single multi-page PDF.
+        """
+        self._capture = []
+        try:
+            viewer = self.context.new_page()
+            try:
+                viewer.goto(open_url, wait_until="networkidle", timeout=self.timeout_ms)
+            except Exception:
+                viewer.goto(open_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            viewer.wait_for_timeout(1200)
+            # Scroll (page + frames) so any lazily-loaded pages request their images.
+            for _ in range(10):
+                try:
+                    viewer.mouse.wheel(0, 4000)
+                except Exception:
+                    pass
+                for fr in viewer.frames:
+                    try:
+                        fr.evaluate("() => window.scrollBy(0, document.body ? document.body.scrollHeight : 2000)")
+                    except Exception:
+                        pass
+                viewer.wait_for_timeout(350)
+            viewer.wait_for_timeout(800)
+        except Exception:
+            return None, "pdf", ""
+        finally:
+            try:
+                viewer.close()
+            except Exception:
+                pass
+
+        images: list[bytes] = []
+        for url in dict.fromkeys(self._capture):
+            if any(d in url.lower() for d in ASSET_DENY):
+                continue
+            try:
+                resp = self.context.request.get(url, timeout=self.timeout_ms)
+                body = resp.body()
+                ctype = (resp.headers or {}).get("content-type", "").lower()
+            except Exception:
+                continue
+            if not body:
+                continue
+            if body[:5] == b"%PDF-" or "application/pdf" in ctype:
+                return body, "pdf", "quickflow-pdf"
+            looks_img = (ctype.startswith("image/") or body[:8] == b"\x89PNG\r\n\x1a\n"
+                         or body[:3] == b"\xff\xd8\xff" or body[:2] in (b"II", b"MM"))
+            if looks_img and len(body) > 8000 and not _looks_like_decorative_image(body):
+                images.append(body)
+
+        if images:
+            pdf = _images_to_pdf(images)
+            if pdf:
+                return pdf, "pdf", f"quickflow-pages({len(images)})"
+            return images[0], _ext_from_bytes(images[0]), "quickflow-page1"
+        return None, "pdf", ""
+
     # -- document open + copy into folder ------------------------------------
     def fetch_document(self, fax: FaxItem) -> DocResult:
         """Get the document file into the patient folder, plus text for naming.
 
         Strategy, in order:
-          1. Per-row Export/Download action (the gear/⚙ menu) -> capture the
-             browser download. This is how a human gets the file, per the user.
-          2. Open the document viewer and download the embedded file (PDF/image)
-             via the authenticated session.
-          3. Headless print-to-PDF of the viewer so *something* lands in the folder.
+          1. Open the QuickFlow viewer (quickflow/index.php?sessionkey=...) and
+             stitch its page images into one PDF — the real fax document.
+          2. Per-row Export/Download action (the gear/⚙ menu).
+          3. Open the viewer and download any embedded file; else print-to-PDF.
         Text for OpenAI naming comes from the row label (which already holds the
         patient name for triaged rows) and, when needed, the opened viewer.
         """
+        # Primary: the confirmed QuickFlow document viewer -> page images -> PDF.
+        if fax.open_url:
+            pdf, ext, how = self._capture_document_pages(fax.open_url)
+            if pdf:
+                return DocResult(text=fax.label, url=fax.open_url,
+                                 pdf_bytes=pdf, file_ext=ext, note=f"file via {how}")
+
         self._capture = []  # collect document responses seen while opening this fax
         pdf_bytes, ext, how = self._download_via_row_actions(fax)
 
@@ -833,6 +906,29 @@ def _looks_like_decorative_image(data: bytes) -> bool:
     if w <= 0 or h <= 0:
         return False
     return w >= 3 * h or (w < 200 and h < 200)
+
+
+def _images_to_pdf(images: list[bytes]) -> bytes | None:
+    """Combine captured fax page images (in order) into one multi-page PDF."""
+    try:
+        import io
+        from PIL import Image
+    except Exception:
+        return None
+    pages = []
+    for raw in images:
+        try:
+            pages.append(Image.open(io.BytesIO(raw)).convert("RGB"))
+        except Exception:
+            continue
+    if not pages:
+        return None
+    try:
+        buf = io.BytesIO()
+        pages[0].save(buf, format="PDF", save_all=True, append_images=pages[1:])
+        return buf.getvalue()
+    except Exception:
+        return None
 
 
 def _ext_from_bytes(data: bytes, suggested: str = "") -> str:
