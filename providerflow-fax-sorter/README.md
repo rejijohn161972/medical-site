@@ -109,11 +109,17 @@ that runs `app\run_hidden.vbs` (invisibly) **every hour at :45, from 08:45
 through 16:45 (4:45 PM), Monday–Friday** — so faxes that arrive during the day
 get sorted within the hour.
 
+- **Catch-up:** a second task (**“ProviderFlow Fax Sorter Logon”**) runs ~30s
+  after each logon, and the hourly task is set to **Start when available**, so a
+  run missed because the PC was **asleep, off, or started late** fires as soon as
+  the machine is back — the day isn't skipped.
 - Each run sorts only **new** faxes; a persistent ledger
   (`%LOCALAPPDATA%\ProviderFlowFaxSorter\processed_faxes.json`) prevents
-  re-creating folders for faxes already handled earlier that day.
+  re-creating folders for faxes already handled earlier that day. A run lock
+  keeps an hourly run and a logon catch-up from overlapping.
 - View/edit the schedule in **Task Scheduler** (`taskschd.msc`).
-- The machine must be **on, online, and awake** during 8:45 AM–4:45 PM.
+- Best results if the machine is **on and online** during 8:45 AM–4:45 PM; if it
+  naps or starts late, the catch-up covers it.
 - Scheduled-run output is logged to
   `%LOCALAPPDATA%\ProviderFlowFaxSorter\scheduled.log`.
 

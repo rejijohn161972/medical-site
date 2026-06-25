@@ -46,30 +46,58 @@ def install_playwright_browser() -> bool:
 
 
 TASK_NAME = "ProviderFlow Fax Sorter"
+LOGON_TASK_NAME = "ProviderFlow Fax Sorter Logon"
+
+
+def _run(cmd: list[str]):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _enable_catch_up(task_name: str) -> None:
+    """Best-effort: make a run missed while asleep/off start as soon as possible.
+
+    schtasks can't set 'Start when available', so use PowerShell. If this fails,
+    the basic hourly + logon triggers still work, so it's non-fatal.
+    """
+    ps = (
+        "$ErrorActionPreference='Stop';"
+        "$s = New-ScheduledTaskSettingsSet -StartWhenAvailable "
+        "-MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2);"
+        "$s.DisallowStartIfOnBatteries=$false; $s.StopIfGoingOnBatteries=$false;"
+        f"Set-ScheduledTask -TaskName '{task_name}' -Settings $s | Out-Null"
+    )
+    try:
+        _run(["powershell", "-NoProfile", "-Command", ps])
+    except Exception:
+        pass
 
 
 def create_task(root_dir: Path) -> bool:
     vbs = root_dir / "app" / "run_hidden.vbs"
+    runner = f'wscript.exe "{vbs}"'
     # Remove earlier task versions so schedules don't stack up.
-    for old in (TASK_NAME, "ProviderFlow Fax Sorter 845AM"):
-        subprocess.run(["schtasks", "/Delete", "/TN", old, "/F"], capture_output=True, text=True)
-    # Run every hour at :45 from 08:45 through 16:45 (4:45 PM), Monday-Friday.
-    cmd = [
-        "schtasks", "/Create",
-        "/TN", TASK_NAME,
-        "/SC", "WEEKLY",
-        "/D", "MON,TUE,WED,THU,FRI",
-        "/ST", "08:45",
-        "/RI", "60",        # repeat every 60 minutes...
-        "/DU", "0008:05",   # ...for 8h05m, so the last run is 16:45
-        "/TR", f'wscript.exe "{vbs}"',
-        "/F",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+    for old in (TASK_NAME, LOGON_TASK_NAME, "ProviderFlow Fax Sorter 845AM"):
+        _run(["schtasks", "/Delete", "/TN", old, "/F"])
+
+    # 1) Hourly: every :45 from 08:45 through 16:45 (4:45 PM), Monday-Friday.
+    hourly = _run([
+        "schtasks", "/Create", "/TN", TASK_NAME, "/SC", "WEEKLY",
+        "/D", "MON,TUE,WED,THU,FRI", "/ST", "08:45", "/RI", "60", "/DU", "0008:05",
+        "/TR", runner, "/F",
+    ])
+    if hourly.returncode != 0:
         print("Could not create the Windows automatic schedule.")
-        print(result.stderr or result.stdout)
+        print(hourly.stderr or hourly.stdout)
         return False
+
+    # 2) Catch-up ~30s after each logon (any day; the ledger prevents duplicates).
+    _run([
+        "schtasks", "/Create", "/TN", LOGON_TASK_NAME, "/SC", "ONLOGON",
+        "/DELAY", "0000:30", "/TR", runner, "/F",
+    ])
+
+    # 3) Bonus: also catch up an hourly run missed while the PC was asleep/off.
+    _enable_catch_up(TASK_NAME)
     return True
 
 
@@ -157,6 +185,7 @@ def main() -> int:
 
     if create_task(root_dir):
         print("Automatic runs scheduled: every hour at :45, 8:45 AM to 4:45 PM, Monday-Friday.")
+        print("Plus a catch-up run when you log in, or after the computer wakes from sleep.")
     else:
         print("Automatic schedule NOT created. You can still run 2_RUN_NOW.bat manually.")
 

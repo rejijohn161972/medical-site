@@ -9,7 +9,9 @@ Run modes:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +26,42 @@ def log_line(msg: str) -> None:
     APPDATA_DIR.mkdir(parents=True, exist_ok=True)
     with (APPDATA_DIR / "last_run.log").open("a", encoding="utf-8") as f:
         f.write(msg + "\n")
+
+
+RUN_LOCK = APPDATA_DIR / "run.lock"
+_lock_held = False
+
+
+def _acquire_lock(max_age_min: float = 45) -> bool:
+    """Prevent overlapping runs (e.g. logon catch-up colliding with an hourly run).
+
+    Fail-open: any lock error returns True so a run is never wrongly blocked. A
+    stale lock older than max_age_min (a crashed run) is taken over.
+    """
+    global _lock_held
+    try:
+        if RUN_LOCK.exists():
+            age_min = (time.time() - RUN_LOCK.stat().st_mtime) / 60.0
+            if age_min < max_age_min:
+                return False
+        RUN_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        RUN_LOCK.write_text(str(os.getpid()), encoding="utf-8")
+        _lock_held = True
+        return True
+    except Exception:
+        return True
+
+
+def _release_lock() -> None:
+    """Only this process removes the lock, and only if it actually acquired it."""
+    global _lock_held
+    if not _lock_held:
+        return
+    try:
+        RUN_LOCK.unlink()
+    except Exception:
+        pass
+    _lock_held = False
 
 
 def _finish(output_dir: str, csv_path, msg_path, start) -> int:
@@ -69,6 +107,12 @@ def run(limit: int | None = None, discovery_only: bool = False, headed: bool | N
     output_dir = cfg["output_dir"]
     debug_dir = APPDATA_DIR / "debug" / start.strftime("%Y%m%d_%H%M%S")
     debug_dir.mkdir(parents=True, exist_ok=True)
+
+    # Only one processing run at a time (hourly + logon catch-up can overlap).
+    if not discovery_only and not _acquire_lock():
+        print("Another run is already in progress; skipping this one.")
+        log_line("Skipped: run lock held by another run.")
+        return 0
 
     print("Logging into ProviderFlow (real browser)...")
     with _new_session(cfg, debug_dir) as session:
@@ -169,6 +213,8 @@ def main() -> int:
         log_line("FATAL: " + repr(e))
         log_line(traceback.format_exc())
         return 1
+    finally:
+        _release_lock()
 
 
 if __name__ == "__main__":
