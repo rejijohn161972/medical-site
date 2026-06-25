@@ -152,28 +152,10 @@ def main() -> int:
     root_dir = Path(__file__).resolve().parent.parent
     install_playwright_browser()
 
-    # Optional login test using the real browser.
-    print("\nTest the ProviderFlow login now? It briefly opens a browser.")
-    if input("Test login? [Y/n]: ").strip().lower() in ("", "y", "yes"):
-        try:
-            from browser_session import BrowserSession
-            debug_dir = APPDATA_DIR / "debug" / "setup_login_test"
-            with BrowserSession(DEFAULT_BASE_URL, username, password, debug_dir, headed=True) as s:
-                s.login()
-                faxes = s.collect_pending_faxes(limit=3)
-                # Quick snapshot only; do NOT open a document here (keeps setup fast).
-                s.discovery_dump(probe_document=False)
-            print(f"Login test PASSED. Sample rows read: {len(faxes)}.")
-            if not faxes:
-                print("Note: login worked but 0 rows were read. A discovery snapshot was saved to:")
-                print(f"  {debug_dir}")
-        except Exception as e:
-            print("\nLogin test FAILED:", e)
-            print("Open ProviderFlow in Chrome and confirm the same username/password works.")
-            print(f"Diagnostic snapshot (if any): {APPDATA_DIR / 'debug' / 'setup_login_test'}")
-            if input("Save settings anyway? [y/N]: ").strip().lower() not in ("y", "yes"):
-                print("Nothing saved.")
-                return 1
+    # No browser login test here. Launching a browser during setup can stall on
+    # this old PHP portal and would block setup before the config is even saved.
+    # Verify the login afterwards with 4_DISCOVERY_TEST.bat (opens a browser and
+    # reads a few rows) or simply run 2_RUN_NOW.bat.
 
     # Don't persist a build-provided key into local config/.env, so the embedded
     # key (or openai_key.txt) stays the single rotatable source of truth.
@@ -194,9 +176,9 @@ def main() -> int:
     write_desktop_button("OPEN SORTED FAXES.bat", root_dir / "3_OPEN_SORTED_FAXES.bat")
 
     print("\nSETUP COMPLETE.")
+    print("  Verify login:   4_DISCOVERY_TEST.bat  (opens a browser, reads a few rows)")
     print("  Run now:        2_RUN_NOW.bat")
     print("  Open folders:   3_OPEN_SORTED_FAXES.bat")
-    print("  Diagnose:       4_DISCOVERY_TEST.bat")
     print("The machine must be on, online, and awake during 8:45 AM-4:45 PM for the hourly runs.")
     return 0
 

@@ -59,9 +59,10 @@ across every frame — exactly as a human sees them. That is the fix.
    Do **not** run it from inside the ZIP.
 2. Double-click **`1_FIRST_TIME_SETUP.bat`**. It will:
    - install the Python dependencies and the Chromium browser engine,
-   - ask for the ProviderFlow login, OpenAI key, model, and output folder,
-   - optionally open a browser to **test the login**,
-   - schedule the automatic **Monday–Friday 8:45 AM** run.
+   - ask for the ProviderFlow login (and OpenAI key, unless it's embedded),
+   - schedule the automatic **hourly Mon–Fri 8:45 AM–4:45 PM** runs.
+   It does **not** open a browser, so it can't stall. Verify the login afterward
+   with **`4_DISCOVERY_TEST.bat`** or by running **`2_RUN_NOW.bat`**.
 
 Your credentials are saved **only on this machine** (under
 `%LOCALAPPDATA%\ProviderFlowFaxSorter` and a local `.env`). They are **never**
