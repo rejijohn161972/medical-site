@@ -345,62 +345,166 @@ class BrowserSession:
 
     # -- document open + copy into folder ------------------------------------
     def fetch_document(self, fax: FaxItem) -> DocResult:
-        """Open the fax document, capture its text, and download the file bytes.
+        """Get the document file into the patient folder, plus text for naming.
 
         Strategy, in order:
-          1. Navigate to the row's open URL (or click the row to trigger a popup).
-          2. From the viewer, find and download the actual file (PDF/image) using
-             the authenticated browser session.
-          3. If no file link is found, fall back to a headless print-to-PDF of the
-             viewer so *something* lands in the patient folder.
+          1. Per-row Export/Download action (the gear/⚙ menu) -> capture the
+             browser download. This is how a human gets the file, per the user.
+          2. Open the document viewer and download the embedded file (PDF/image)
+             via the authenticated session.
+          3. Headless print-to-PDF of the viewer so *something* lands in the folder.
+        Text for OpenAI naming comes from the row label (which already holds the
+        patient name for triaged rows) and, when needed, the opened viewer.
         """
-        viewer, opened_via = self._open_viewer(fax)
-        if viewer is None:
+        pdf_bytes, ext, how = self._download_via_row_actions(fax)
+
+        # Fast path: file in hand AND the row already names the patient -> done,
+        # no need to open the viewer (keeps a 36-row run fast).
+        if pdf_bytes and NAME_RE.search(fax.label):
             return DocResult(text=fax.label, url=fax.open_url or self.page.url,
-                             note="could not open document viewer")
+                             pdf_bytes=pdf_bytes, file_ext=ext, note=f"file via {how}")
+
+        viewer, opened_via = self._open_viewer(fax)
+        text, final_url, full_html = fax.label, (fax.open_url or self.page.url), ""
+        if viewer is not None:
+            try:
+                viewer.wait_for_timeout(1000)
+                text_parts, html_parts, file_links = [], [], []
+                for frame in viewer.frames:
+                    try:
+                        for ta in frame.locator("textarea").all():
+                            val = (ta.input_value() or "").strip()
+                            if len(val) > 20:
+                                text_parts.append(val)
+                        body = frame.evaluate("() => document.body ? document.body.innerText : ''") or ""
+                        body = re.sub(r"[ \t]+\n", "\n", body).strip()
+                        if len(body) > 40:
+                            text_parts.append(body[:8000])
+                        html = frame.content() or ""
+                        html_parts.append(html[:30000])
+                        file_links += self._file_links_in(html, frame.url or viewer.url)
+                    except Exception:
+                        continue
+
+                final_url = viewer.url
+                full_html = "\n".join(html_parts)
+                if not pdf_bytes:
+                    pdf_bytes, ext = self._download_first_file(file_links)
+                    if pdf_bytes:
+                        how = "viewer-file"
+                    elif not self.headed:
+                        try:
+                            pdf_bytes, ext, how = viewer.pdf(), "pdf", "print-pdf"
+                        except Exception:
+                            pdf_bytes = None
+
+                safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", fax.fax_id)[:60]
+                self._dump_html_for(viewer, f"fax_{safe}.html")
+                text = (fax.label + "\n\n" + "\n\n".join(dict.fromkeys(text_parts))).strip()
+            finally:
+                try:
+                    if viewer is not self.page:
+                        viewer.close()
+                except Exception:
+                    pass
+
+        note = (f"file via {how}" if pdf_bytes else "no file obtained") + f"; viewer={opened_via or 'n/a'}"
+        return DocResult(text=text, url=final_url, html=full_html,
+                         pdf_bytes=pdf_bytes, file_ext=ext, note=note)
+
+    def _download_via_row_actions(self, fax: FaxItem) -> tuple[bytes | None, str, str]:
+        """Click the row's gear/Export action and capture the downloaded file."""
+        row = self._locate_full_row(fax)
+        if row is None:
+            return None, "pdf", ""
+        toggle = self._find_actions_toggle(row)
+        if toggle is None:
+            return None, "pdf", ""
+        try:
+            toggle.scroll_into_view_if_needed(timeout=3000)
+            toggle.click()
+        except Exception:
+            return None, "pdf", ""
+        self.page.wait_for_timeout(450)
+
+        item = None
+        for frame in self.page.frames:
+            try:
+                cand = frame.get_by_text(
+                    re.compile(r"\b(export|download|save\s*as\s*pdf|print\s*to\s*pdf|pdf)\b", re.I)
+                ).first
+                if cand.count() > 0 and cand.is_visible():
+                    item = cand
+                    break
+            except Exception:
+                continue
+        if item is None:
+            return None, "pdf", ""
 
         try:
-            viewer.wait_for_timeout(1000)
-            text_parts, html_parts, file_links = [], [], []
-            for frame in viewer.frames:
-                try:
-                    for ta in frame.locator("textarea").all():
-                        val = (ta.input_value() or "").strip()
-                        if len(val) > 20:
-                            text_parts.append(val)
-                    body = frame.evaluate("() => document.body ? document.body.innerText : ''") or ""
-                    body = re.sub(r"[ \t]+\n", "\n", body).strip()
-                    if len(body) > 40:
-                        text_parts.append(body[:8000])
-                    html = frame.content() or ""
-                    html_parts.append(html[:30000])
-                    file_links += self._file_links_in(html, frame.url or viewer.url)
-                except Exception:
-                    continue
-
-            final_url = viewer.url
-            full_html = "\n".join(html_parts)
-            pdf_bytes, ext = self._download_first_file(file_links)
-
-            if not pdf_bytes and not self.headed:
-                try:
-                    pdf_bytes, ext = viewer.pdf(), "pdf"  # print-to-PDF fallback (headless only)
-                except Exception:
-                    pdf_bytes = None
-
-            safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", fax.fax_id)[:60]
-            self._dump_html_for(viewer, f"fax_{safe}.html")
-
-            text = (fax.label + "\n\n" + "\n\n".join(dict.fromkeys(text_parts))).strip()
-            note = f"opened via {opened_via}; " + ("file downloaded" if pdf_bytes else "no file link found")
-            return DocResult(text=text, url=final_url, html=full_html,
-                             pdf_bytes=pdf_bytes, file_ext=ext, note=note)
-        finally:
+            with self.page.expect_download(timeout=15000) as dl:
+                item.click()
+            download = dl.value
+            dest = self.debug_dir / ("dl_" + re.sub(r"[^A-Za-z0-9]+", "_", fax.fax_id)[:40])
+            download.save_as(str(dest))
+            data = Path(dest).read_bytes()
+            return data, _ext_from_bytes(data, download.suggested_filename), "row-export"
+        except Exception:
+            # Some Export actions open the file in a new tab instead of downloading.
             try:
-                if viewer is not self.page:
-                    viewer.close()
+                pg = self.context.pages[-1]
+                if "pdf" in (pg.url or "").lower():
+                    body = self.context.request.get(pg.url).body()
+                    if body[:5] == b"%PDF-":
+                        if pg is not self.page:
+                            pg.close()
+                        return body, "pdf", "row-export-tab"
             except Exception:
                 pass
+            return None, "pdf", ""
+
+    def _locate_full_row(self, fax: FaxItem):
+        """Locate the <tr> for this fax by its most distinctive text."""
+        m = NAME_RE.search(fax.label or "")
+        key = m.group(1) if m else ""
+        if not key:
+            m2 = re.search(r"Fax from \d+", fax.label or "")
+            key = m2.group(0) if m2 else (fax.label or "")[:25]
+        if not key.strip():
+            return None
+        for frame in self.page.frames:
+            try:
+                row = frame.locator("table tr", has_text=key).first
+                if row and row.count() > 0:
+                    return row
+            except Exception:
+                continue
+        return None
+
+    def _find_actions_toggle(self, row):
+        """Find the per-row actions/gear control inside a row locator."""
+        selectors = [
+            "[class*=cog]", "[class*=gear]", "[class*=ellipsis]", "[class*=fa-bars]",
+            "a.dropdown-toggle", "button.dropdown-toggle", "[data-toggle='dropdown']",
+            "[title*='action' i]", "[title*='option' i]", "[title*='menu' i]",
+            "img[src*='gear']", "img[src*='cog']", "img[src*='setting']",
+        ]
+        for sel in selectors:
+            try:
+                c = row.locator(sel).first
+                if c.count() > 0:
+                    return c
+            except Exception:
+                continue
+        # Fallback: a clickable element in the last couple of cells (the gear column).
+        try:
+            c = row.locator("td:last-child a, td:last-child button, td:last-child [onclick], "
+                            "td:nth-last-child(2) a, td:nth-last-child(2) [onclick]").first
+            if c.count() > 0:
+                return c
+        except Exception:
+            pass
+        return None
 
     def _open_viewer(self, fax: FaxItem):
         """Return (page, how) for the opened document, or (None, '')."""
@@ -504,6 +608,34 @@ class BrowserSession:
                 lines.append("")
                 lines.append(f"[Frame {i}] headers: " + " | ".join(headers[:12]))
 
+        # Probe the per-row gear/Export menu (how the user downloads the file).
+        if probe_document and faxes:
+            lines += ["", "Row actions (gear/Export) probe (first row):"]
+            try:
+                row = self._locate_full_row(faxes[0])
+                toggle = self._find_actions_toggle(row) if row is not None else None
+                lines.append(f"  gear/actions control found: {toggle is not None}")
+                if toggle is not None:
+                    toggle.click()
+                    self.page.wait_for_timeout(500)
+                    items = []
+                    for frame in self.page.frames:
+                        try:
+                            items += frame.evaluate(
+                                "() => Array.from(document.querySelectorAll('a,button,li,span,div'))"
+                                ".filter(e => e.offsetParent !== null)"
+                                ".map(e => ((e.innerText||'').trim().slice(0,40) + ' :: ' + "
+                                "(e.getAttribute('href')||e.getAttribute('onclick')||'')))"
+                                ".filter(t => /export|download|pdf|print|save|view/i.test(t))"
+                            ) or []
+                        except Exception:
+                            continue
+                    for it in list(dict.fromkeys(items))[:25]:
+                        lines.append("    - " + _redact(it))
+                    self._dump_html("row_actions_menu.html")
+            except Exception as e:
+                lines.append(f"  actions probe error: {e}")
+
         # Open the first document and record exactly how it behaves.
         if probe_document and faxes:
             lines += ["", "Document-open probe (first row):"]
@@ -584,6 +716,22 @@ def _first_match(patterns: list[str], text: str) -> str:
         if m:
             return m.group(1)
     return ""
+
+
+def _ext_from_bytes(data: bytes, suggested: str = "") -> str:
+    if data[:5] == b"%PDF-":
+        return "pdf"
+    if data[:2] in (b"II", b"MM"):
+        return "tiff"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if suggested and "." in suggested:
+        ext = suggested.rsplit(".", 1)[-1].lower()
+        if 1 <= len(ext) <= 5 and ext.isalnum():
+            return ext
+    return "pdf"
 
 
 def _norm(s: str) -> str:
