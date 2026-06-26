@@ -393,32 +393,50 @@ class BrowserSession:
     def _capture_document_pages(self, open_url: str) -> tuple[bytes | None, str, str]:
         """Open the QuickFlow viewer and combine its fax page images into one PDF.
 
-        ProviderFlow shows the fax at quickflow/index.php?sessionkey=<key> with
-        each page rendered as an image. We open it, scroll to load every page,
-        capture the page images (and any PDF) from network traffic, and stitch
-        the images into a single multi-page PDF.
+        The fax pages render as large <img> elements. We extract each page's
+        pixels IN-PAGE via canvas (no network re-fetch, so this cannot stall),
+        decode them, and stitch them into one PDF. A short, bounded URL fetch is
+        only a fallback if canvas extraction yields nothing.
         """
-        self._capture = []
+        import base64
+
+        # Pull each large image's pixels straight from the DOM as a data: URL.
+        extract_js = (
+            "() => Array.from(document.images)"
+            ".filter(i => i.naturalWidth >= 500 && i.naturalHeight >= 400)"
+            ".slice(0, 60).map(i => {"
+            "  try {"
+            "    const c = document.createElement('canvas');"
+            "    c.width = i.naturalWidth; c.height = i.naturalHeight;"
+            "    c.getContext('2d').drawImage(i, 0, 0);"
+            "    return c.toDataURL('image/png');"
+            "  } catch (e) { return 'SRC:' + i.src; }"  # tainted -> hand back the URL
+            "})"
+        )
+
+        data_urls: list[str] = []
         try:
             viewer = self.context.new_page()
-            viewer.on("response", self._on_response)  # capture only this viewer's responses
-            # domcontentloaded only — never networkidle (this app holds connections
-            # open, which would stall). A fixed settle wait lets page images load.
-            viewer.goto(open_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-            viewer.wait_for_timeout(1500)
-            # A few quick scrolls so any lazily-loaded pages request their images.
-            for _ in range(6):
+            try:
+                viewer.goto(open_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            except Exception:
                 try:
-                    viewer.mouse.wheel(0, 4000)
+                    viewer.close()
                 except Exception:
                     pass
-                for fr in viewer.frames:
-                    try:
-                        fr.evaluate("() => window.scrollBy(0, document.body ? document.body.scrollHeight : 2000)")
-                    except Exception:
-                        pass
-                viewer.wait_for_timeout(250)
-            viewer.wait_for_timeout(500)
+                return None, "pdf", ""
+            viewer.wait_for_timeout(2500)  # let the page images decode
+            for fr in viewer.frames:
+                try:
+                    fr.evaluate("() => window.scrollTo(0, document.body ? document.body.scrollHeight : 0)")
+                except Exception:
+                    pass
+            viewer.wait_for_timeout(1200)
+            for fr in viewer.frames:
+                try:
+                    data_urls += fr.evaluate(extract_js) or []
+                except Exception:
+                    continue
         except Exception:
             return None, "pdf", ""
         finally:
@@ -427,30 +445,42 @@ class BrowserSession:
             except Exception:
                 pass
 
-        images: list[bytes] = []
-        for url in dict.fromkeys(self._capture):
-            if any(d in url.lower() for d in ASSET_DENY):
+        page_imgs: list[bytes] = []
+        fallback_srcs: list[str] = []
+        for du in data_urls[:80]:
+            if du.startswith("SRC:"):
+                fallback_srcs.append(du[4:])
                 continue
             try:
-                resp = self.context.request.get(url, timeout=self.timeout_ms)
-                body = resp.body()
-                ctype = (resp.headers or {}).get("content-type", "").lower()
+                raw = base64.b64decode(du.split(",", 1)[1])
             except Exception:
                 continue
-            if not body:
-                continue
-            if body[:5] == b"%PDF-" or "application/pdf" in ctype:
-                return body, "pdf", "quickflow-pdf"
-            looks_img = (ctype.startswith("image/") or body[:8] == b"\x89PNG\r\n\x1a\n"
-                         or body[:3] == b"\xff\xd8\xff" or body[:2] in (b"II", b"MM"))
-            if looks_img and len(body) > 8000 and not _looks_like_decorative_image(body):
-                images.append(body)
+            if len(raw) > 4000 and not _looks_like_decorative_image(raw):
+                page_imgs.append(raw)
 
-        if images:
-            pdf = _images_to_pdf(images)
+        # Fallback: fetch tainted/cross-origin image URLs (bounded, short timeout).
+        if not page_imgs:
+            for url in list(dict.fromkeys(fallback_srcs))[:60]:
+                if any(d in url.lower() for d in ASSET_DENY):
+                    continue
+                try:
+                    resp = self.context.request.get(url, timeout=12000)
+                    body = resp.body()
+                    ctype = (resp.headers or {}).get("content-type", "").lower()
+                except Exception:
+                    continue
+                if not body:
+                    continue
+                if body[:5] == b"%PDF-" or "application/pdf" in ctype:
+                    return body, "pdf", "quickflow-pdf"
+                if len(body) > 4000 and not _looks_like_decorative_image(body):
+                    page_imgs.append(body)
+
+        if page_imgs:
+            pdf = _images_to_pdf(page_imgs)
             if pdf:
-                return pdf, "pdf", f"quickflow-pages({len(images)})"
-            return images[0], _ext_from_bytes(images[0]), "quickflow-page1"
+                return pdf, "pdf", f"quickflow-pages({len(page_imgs)})"
+            return page_imgs[0], _ext_from_bytes(page_imgs[0]), "quickflow-page1"
         return None, "pdf", ""
 
     # -- document open + copy into folder ------------------------------------

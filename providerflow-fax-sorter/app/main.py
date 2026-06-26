@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -32,17 +33,38 @@ RUN_LOCK = APPDATA_DIR / "run.lock"
 _lock_held = False
 
 
+def _lock_owner_alive() -> bool:
+    """Is the process that wrote run.lock still running? (Windows tasklist.)
+
+    Lets us take over a lock left behind when a hung window was force-closed,
+    instead of skipping every later run.
+    """
+    try:
+        pid = int(RUN_LOCK.read_text(encoding="utf-8").strip())
+    except Exception:
+        return False  # unreadable/empty -> treat as stale
+    if pid == os.getpid():
+        return False
+    try:
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                             capture_output=True, text=True, timeout=5)
+        return str(pid) in (out.stdout or "")
+    except Exception:
+        return True  # can't tell -> assume alive (avoid a double login)
+
+
 def _acquire_lock(max_age_min: float = 45) -> bool:
     """Prevent overlapping runs (e.g. logon catch-up colliding with an hourly run).
 
     Fail-open: any lock error returns True so a run is never wrongly blocked. A
-    stale lock older than max_age_min (a crashed run) is taken over.
+    stale lock (older than max_age_min, or whose owner process is gone) is taken
+    over.
     """
     global _lock_held
     try:
         if RUN_LOCK.exists():
             age_min = (time.time() - RUN_LOCK.stat().st_mtime) / 60.0
-            if age_min < max_age_min:
+            if age_min < max_age_min and _lock_owner_alive():
                 return False
         RUN_LOCK.parent.mkdir(parents=True, exist_ok=True)
         RUN_LOCK.write_text(str(os.getpid()), encoding="utf-8")
