@@ -143,16 +143,24 @@ class BrowserSession:
                 "    pip install -r requirements.txt\n"
                 "    python -m playwright install chromium"
             )
+        print("  starting browser engine...", flush=True)
         self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(headless=not self.headed)
+        self._browser = self._pw.chromium.launch(
+            headless=not self.headed,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            timeout=60000,
+        )
         self.context = self._browser.new_context(
             accept_downloads=True,
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/126 Safari/537.36"),
         )
         self.context.set_default_timeout(self.timeout_ms)
-        self.context.on("response", self._on_response)
+        # NOTE: the document-page response listener is attached per-viewer in
+        # _capture_document_pages(), NOT context-wide, so it never fires during
+        # login/scraping (a context-wide listener there could stall the run).
         self.page = self.context.new_page()
+        print("  browser ready.", flush=True)
         return self
 
     def __exit__(self, *exc) -> None:
@@ -192,6 +200,7 @@ class BrowserSession:
 
         # The real login form posts to login.php with visible username/password
         # plus hidden fields; a real browser submits the hidden fields for us.
+        print("  opening login page...", flush=True)
         self.page.goto(self.base_url + "/index.php", wait_until="domcontentloaded")
         self._safe_screenshot("01_login_page.png")
 
@@ -201,6 +210,7 @@ class BrowserSession:
             self._dump_html("01_login_page.html")
             raise RuntimeError("Could not find the ProviderFlow username/password fields on the login page.")
 
+        print("  entering credentials...", flush=True)
         user_box.fill(self.username)
         pass_box.fill(self.password)
 
@@ -215,6 +225,7 @@ class BrowserSession:
         except Exception:
             pass_box.press("Enter")
 
+        print("  waiting for dashboard...", flush=True)
         self._wait_idle()
         self._safe_screenshot("02_after_login.png")
 
@@ -390,6 +401,7 @@ class BrowserSession:
         self._capture = []
         try:
             viewer = self.context.new_page()
+            viewer.on("response", self._on_response)  # capture only this viewer's responses
             # domcontentloaded only — never networkidle (this app holds connections
             # open, which would stall). A fixed settle wait lets page images load.
             viewer.goto(open_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
