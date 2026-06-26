@@ -1,0 +1,15 @@
+# ProviderFlow Fax Sorter dependencies
+#
+# Playwright drives a real Chromium browser. ProviderFlow renders its pending
+# list with client-side JavaScript/AJAX (batchtable.php), so a plain HTTP
+# scraper sees an empty page ("Found 0 faxes"). A real browser sees the rows.
+playwright>=1.44.0
+
+# Used only for the OpenAI Chat Completions call.
+requests>=2.31.0
+
+# Combines the captured fax page images into a single PDF per document.
+Pillow>=10.0.0
+
+# Loads PF_/OPENAI_ settings from a local .env file when present.
+python-dotenv>=1.0.0
